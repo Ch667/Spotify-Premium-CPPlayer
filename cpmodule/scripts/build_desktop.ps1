@@ -24,7 +24,8 @@ $Entry = @{ "windows" = "cp_spotify.dll"; "macos" = "libcp_spotify.dylib"; "linu
 $Stage = "./target/cp_stage"
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 New-Item -ItemType Directory -Force $Stage | Out-Null
-Copy-Item "./target/$Target/release/$Entry" $Stage
+# workspace 成员共享仓库根 target/，产物不在 cpmodule/target/
+Copy-Item "../target/$Target/release/$Entry" $Stage
 
 $OutDir = "./target/cp_out"
 New-Item -ItemType Directory -Force $OutDir | Out-Null

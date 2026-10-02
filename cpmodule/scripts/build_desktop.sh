@@ -22,7 +22,8 @@ cargo build --release --features jni --target "$TARGET"
 STAGE=./target/cp_stage
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "./target/$TARGET/release/$ENTRY" "$STAGE/"
+# workspace 成员共享仓库根 target/，产物不在 cpmodule/target/
+cp "../target/$TARGET/release/$ENTRY" "$STAGE/"
 
 python3 scripts/pack_module.py --platform "$PLATFORM" --version "$VERSION" \
     --stage "$STAGE" --repo "$REPO" --out ./target/cp_out
