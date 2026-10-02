@@ -1,0 +1,8 @@
+# CI（Linux/macOS runner）bash 脚本必须是 LF
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
+*.proto text eol=lf

@@ -1,0 +1,71 @@
+[package]
+name = "cp-spotify-module"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CPPlayer 音源模块：librespot 封装（JNI Provider，本地 WAV 流）"
+publish = false
+
+[lib]
+name = "cp_spotify"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "cp-spotify-server"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
+[features]
+default = []
+# JNI 导出（Android / Desktop 通用）
+jni = ["dep:jni"]
+# Android 变体（预留：与 jni 相同，后续挂 android logger）
+jni-android = ["jni"]
+# 独立调试服务（bin/server.rs）
+server = []
+
+[dependencies]
+librespot-core = { path = "../core", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+] }
+librespot-playback = { path = "../playback", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+] }
+librespot-metadata = { path = "../metadata", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+] }
+librespot-oauth = { path = "../oauth", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+] }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "fs",
+    "signal",
+    "io-util",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots",
+] }
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+jni = { version = "0.21", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

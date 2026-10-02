@@ -1,3 +1,8 @@
+[workspace]
+# cpmodule 是 CPPlayer 音源模块（JNI Provider），不是根库的依赖，
+# 显式列入 members 以共享本 workspace 的 edition / lints。
+members = ["cpmodule"]
+
 [package]
 name = "librespot"
 version = "0.8.0"

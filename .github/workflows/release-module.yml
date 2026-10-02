@@ -1,0 +1,115 @@
+# cp-spotify-module 自动发版：tag `module-v*` 触发 → 三端多架构 matrix 构建 →
+# 打包模块 zip + version.json → GitHub Release。
+# 本地发布入口：cpmodule/scripts/release_module.ps1（干净树检查 + tag 查重）。
+name: release-module
+
+on:
+  push:
+    branches: ["dev", "main"]
+    tags: ["module-v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  REPO: ${{ github.repository }}
+  # tag 构建时取 tag 版本；手动触发时留空，脚本回退到 Cargo.toml 版本。
+  MODULE_VERSION: ${{ startsWith(github.ref, 'refs/tags/module-v') && format('{0}', github.ref_name) || '' }}
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build (3 ABIs)
+        run: |
+          cd cpmodule
+          VER="${MODULE_VERSION#module-v}"
+          bash scripts/build_android.sh "$VER" "$REPO"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-android
+          path: cpmodule/target/cp_out/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build & pack
+        shell: pwsh
+        run: |
+          cd cpmodule
+          .\scripts\build_desktop.ps1 -Repo "$env:REPO"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-windows
+          path: cpmodule/target/cp_out/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build aarch64
+        run: |
+          cd cpmodule
+          VER="${MODULE_VERSION#module-v}"
+          bash scripts/build_desktop.sh aarch64-apple-darwin "$REPO"
+          mv target/cp_out/cp-spotify-module-macos-*.zip "target/cp_out/cp-spotify-module-macos-aarch64-$VER.zip"
+          mv target/cp_out/version-macos.json "target/cp_out/version-macos-aarch64.json"
+      - name: Build x86_64
+        run: |
+          cd cpmodule
+          VER="${MODULE_VERSION#module-v}"
+          bash scripts/build_desktop.sh x86_64-apple-darwin "$REPO"
+          mv target/cp_out/version-macos.json "target/cp_out/version-macos-x86_64.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-macos
+          path: cpmodule/target/cp_out/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build & pack
+        run: |
+          cd cpmodule
+          bash scripts/build_desktop.sh "" "$REPO"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-linux
+          path: cpmodule/target/cp_out/*
+
+  release:
+    needs: [android, windows, macos, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/module-v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find dist -type f -exec mv {} release/ \;
+          ls -la release/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/*.zip
+            release/*.json
