@@ -4,9 +4,9 @@
 name: release-module
 
 on:
+  # 任意 push 均自动构建（branches+tags 过滤共存曾导致 push 事件不匹配）；
+  # tag module-v* 时额外走 Release 发布。
   push:
-    branches: ["dev", "main"]
-    tags: ["module-v*"]
   workflow_dispatch: {}
 
 permissions:
