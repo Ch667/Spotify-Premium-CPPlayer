@@ -9,6 +9,10 @@ on:
   push:
   workflow_dispatch: {}
 
+concurrency:
+  group: release-module-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -54,32 +58,6 @@ jobs:
           name: module-windows
           path: cpmodule/target/cp_out/*
 
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - name: Build aarch64
-        run: |
-          cd cpmodule
-          VER="${MODULE_VERSION#module-v}"
-          bash scripts/build_desktop.sh aarch64-apple-darwin "$REPO"
-          mv target/cp_out/cp-spotify-module-macos-*.zip "target/cp_out/cp-spotify-module-macos-aarch64-$VER.zip"
-          mv target/cp_out/version-macos.json "target/cp_out/version-macos-aarch64.json"
-      - name: Build x86_64
-        run: |
-          cd cpmodule
-          VER="${MODULE_VERSION#module-v}"
-          bash scripts/build_desktop.sh x86_64-apple-darwin "$REPO"
-          mv target/cp_out/version-macos.json "target/cp_out/version-macos-x86_64.json"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: module-macos
-          path: cpmodule/target/cp_out/*
-
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -96,7 +74,7 @@ jobs:
           path: cpmodule/target/cp_out/*
 
   release:
-    needs: [android, windows, macos, linux]
+    needs: [android, windows, linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/module-v')
     steps:
