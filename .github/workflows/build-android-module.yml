@@ -1,0 +1,58 @@
+name: Build Spotify Android module
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/browser-login]
+    paths:
+      - "cpmodule/**"
+      - ".github/workflows/build-android-module.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/browser-login
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: 27.2.12479018
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build native libraries
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          cd cpmodule
+          export RUSTFLAGS="-Clink-arg=-Wl,-z,max-page-size=16384"
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./target/jniLibs build --release --features jni-android
+      - name: Package module
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cpmodule/Cargo.toml | head -1)
+          STAGE="$GITHUB_WORKSPACE/cpmodule/target/cp_stage"
+          OUT="$GITHUB_WORKSPACE/cpmodule/target/cp_out"
+          rm -rf "$STAGE" "$OUT"
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            mkdir -p "$STAGE/lib/$ABI"
+            cp "cpmodule/target/jniLibs/$ABI/libcp_spotify.so" "$STAGE/lib/$ABI/"
+          done
+          python3 cpmodule/scripts/pack_module.py --platform android --version "$VERSION" --stage "$STAGE" --repo Ch667/Spotify-Premium-CPPlayer --out "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cp-spotify-module-android
+          path: |
+            cpmodule/target/cp_out/*.zip
+            cpmodule/target/cp_out/version-android.json
+          if-no-files-found: error
+          retention-days: 30
