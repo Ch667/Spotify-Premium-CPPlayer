@@ -308,12 +308,18 @@ fn qr_key() -> String {
 
 /// login/qr/create：发起设备码流程。qrurl 用 verification_uri_complete
 /// （验证码已预填），宿主 QrCodeImage(qrUrl) 扫码即直达授权确认页。
+///
+/// 另外顺手用系统浏览器打开同一个链接：这是网页地址，用 Spotify App 扫是扫不出来的，
+/// 直接跳到浏览器才是这个设备码流程的正确姿势（见 `opener`）。
 async fn qr_create(core: &Core) -> Value {
     match Arc::clone(&core.inner).auth_login_start().await {
-        Ok((qrurl, user_code)) => json!({
-            "code": 200,
-            "data": {"qrurl": qrurl, "userCode": user_code}
-        }),
+        Ok((qrurl, user_code)) => {
+            crate::opener::open_url(&qrurl);
+            json!({
+                "code": 200,
+                "data": {"qrurl": qrurl, "userCode": user_code}
+            })
+        }
         Err(e) => json!({"code": 500, "msg": e}),
     }
 }

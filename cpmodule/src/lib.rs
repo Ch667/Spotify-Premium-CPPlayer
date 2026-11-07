@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod engine;
+pub mod opener;
 pub mod stream;
 
 #[cfg(feature = "jni")]
