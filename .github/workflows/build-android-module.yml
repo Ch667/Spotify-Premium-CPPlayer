@@ -30,8 +30,6 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Build native libraries
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           cd cpmodule
           export RUSTFLAGS="-Clink-arg=-Wl,-z,max-page-size=16384"
