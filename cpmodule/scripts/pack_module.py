@@ -14,13 +14,41 @@ import json
 import zipfile
 from pathlib import Path
 
+# 宿主内部方法名 → 本模块端点（Provider Standard v3 §3.2：未映射的方法按原名直传，
+# 这里把实现过的都显式列出来，读 manifest 就能知道这个音源到底支持什么）。
 API_MAP = {
     "cloudsearch": "search",
     "song/url/v1": "song/url",
     "song/url/v1/302": "song/url",
+    "song/download/url/v1": "song/url",
     "song/detail": "song/detail",
     "lyric/new": "lyric",
+    # 曲库浏览（v0.2.0 新增）
+    "album": "album",
+    "artist/detail": "artist/detail",
+    "artist/songs": "artist/songs",
+    "artist/top/song": "artist/songs",
+    "artist/album": "artist/albums",
+    "playlist/detail": "playlist/detail",
+    "playlist/track/all": "playlist/track/all",
+    # 账户（设备码授权 → 宿主 QR 通道）
+    "login/qr/key": "login/qr/key",
+    "login/qr/create": "login/qr/create",
+    "login/qr/check": "login/qr/check",
+    "login/status": "login/status",
+    "logout": "logout",
 }
+
+# 能力网格：只声明真正实现的。声明后未列出的能力在 UI 上隐藏（指南 §4），
+# 所以这里刻意不写 comments / cloudDrive / recommend —— Spotify 没有这三样，
+# 留着入口只会点开一片空白。
+CAPABILITIES = [
+    "search",
+    "playback",
+    "albumExplorer",
+    "artistExplorer",
+    "qrLogin",
+]
 
 ENTRY = {
     "android": "libcp_spotify.so",
@@ -46,6 +74,7 @@ def build_manifest(platform: str, version: str, repo: str) -> dict:
         "type": "jni",
         "entryPoint": ENTRY[platform],
         "supportedAbis": DEFAULT_ABI[platform],
+        "capabilities": CAPABILITIES,
         "apiMap": API_MAP,
         # 账户页登录渠道：设备码流程映射到宿主 QR 通道（扫码打开 spotify.com/pair）
         "loginMethods": ["qr"],

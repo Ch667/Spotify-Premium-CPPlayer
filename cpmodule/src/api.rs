@@ -140,6 +140,13 @@ pub async fn dispatch(core: &Core, method: &str, params: Value) -> Value {
         "song/detail" => song_detail(core, params).await,
         "lyric" | "lyric/new" => lyric(),
         "scrobble" => json!({"code": 200}),
+        // ---- 曲库浏览（v0.2.0）----
+        "album" => album(core, params).await,
+        "artist/detail" => artist_detail(core, params).await,
+        "artist/songs" => artist_songs(core, params).await,
+        "artist/albums" => artist_albums(core, params).await,
+        "playlist/detail" => playlist_detail(core, params).await,
+        "playlist/track/all" => playlist_tracks(core, params).await,
         // ---- 宿主账户页登录通道（NCM 形状，AccountScreen 按 manifest.loginMethods 生成）----
         "login/qr/key" => json!({"code": 200, "data": {"unikey": qr_key()}}),
         "login/qr/create" => qr_create(core).await,
@@ -152,6 +159,221 @@ pub async fn dispatch(core: &Core, method: &str, params: Value) -> Value {
         "auth/logout" => auth_logout(core),
         _ => json!({"code": 404, "msg": format!("unsupported method: {method}")}),
     }
+}
+
+// ---------------------------------------------------------------- 曲库浏览（v0.2.0）
+
+/// Spotify 对象里的封面：`images[0].url`（缺了就回空串，交给宿主画占位图）。
+fn cover_of(v: &Value) -> String {
+    v["images"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|i| i["url"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 多歌手拼成名宿主要的那一个 `artist` 字段（指南 §5.1：多歌手用 " / " 连接）。
+fn artist_names(v: &Value) -> String {
+    v["artists"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default()
+}
+
+/// 扁平曲目（指南 §5.1）。专辑 / 歌单里的 track 对象没有 `album` 字段，
+/// 所以父级的专辑名与封面由调用方显式传进来。
+fn flat_track(t: &Value, album: &str, cover: &str) -> Value {
+    let uri = t["uri"].as_str().unwrap_or_default();
+    let id = uri.strip_prefix("spotify:track:").unwrap_or(uri);
+    json!({
+        "id": id,
+        "title": t["name"],
+        "artist": artist_names(t),
+        "album": album,
+        "durationMs": t["duration_ms"],
+        "coverUrl": cover,
+    })
+}
+
+/// 搜索结果里的专辑（指南 §5.1 的专辑条目：id/name/coverUrl/artist/publishDate）。
+fn map_album_brief(a: &Value) -> Value {
+    json!({
+        "id": a["id"],
+        "name": a["name"],
+        "coverUrl": cover_of(a),
+        "artist": artist_names(a),
+        "publishDate": a["release_date"],
+    })
+}
+
+/// GET 一个 Spotify Web API 端点并解成 JSON；失败统一压成 `(code,msg)` 给宿主看。
+async fn web_get(core: &Core, url: String, what: &str) -> Result<Value, Value> {
+    let token = web_token(core)
+        .await
+        .map_err(|e| json!({"code": 401, "msg": e}))?;
+    match core.inner.http().get(url).bearer(&token).send().await {
+        Ok(r) => r
+            .json::<Value>()
+            .await
+            .map_err(|e| json!({"code": 502, "msg": format!("decode: {e}")})),
+        Err(e) => Err(json!({"code": 502, "msg": format!("{what}: {e}")})),
+    }
+}
+
+/// 专辑详情（指南 §7.2）：`data{ id,title,cover,artist,description,tracks[...] }`。
+async fn album(core: &Core, params: Value) -> Value {
+    let Some(id) = get_id(&params) else {
+        return json!({"code": 400, "msg": "missing id"});
+    };
+    let body = match web_get(core, format!("{WEB_API}/albums/{id}"), "album").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let name = body["name"].as_str().unwrap_or_default().to_string();
+    let cover = cover_of(&body);
+    let artist = artist_names(&body);
+    let tracks: Vec<Value> = body["tracks"]["items"]
+        .as_array()
+        .map(|items| items.iter().map(|t| flat_track(t, &name, &cover)).collect())
+        .unwrap_or_default();
+    json!({"code": 200, "data": {
+        "id": body["id"],
+        "title": body["name"],
+        "cover": cover,
+        "artist": artist,
+        "publishDate": body["release_date"],
+        "description": body["label"],
+        "tracks": tracks,
+    }})
+}
+
+/// 歌手资料（指南 §7.1.1）。
+async fn artist_detail(core: &Core, params: Value) -> Value {
+    let Some(id) = get_id(&params) else {
+        return json!({"code": 400, "msg": "missing id"});
+    };
+    let body = match web_get(core, format!("{WEB_API}/artists/{id}"), "artist").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let genres = body["genres"].as_array().cloned().unwrap_or_default();
+    let brief = genres
+        .iter()
+        .filter_map(|g| g.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    json!({"code": 200, "data": {
+        "id": body["id"],
+        "name": body["name"],
+        "avatar": cover_of(&body),
+        "briefDesc": brief,
+        "alias": genres,
+        "fans": body["followers"]["total"],
+    }})
+}
+
+/// 歌手热门单曲（指南 §7.1.2）。
+async fn artist_songs(core: &Core, params: Value) -> Value {
+    let Some(id) = get_id(&params) else {
+        return json!({"code": 400, "msg": "missing id"});
+    };
+    let body = match web_get(core, format!("{WEB_API}/artists/{id}/top-tracks"), "artist/top-tracks").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let tracks: Vec<Value> = body["tracks"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|t| {
+                    let album = t["album"]["name"].as_str().unwrap_or_default();
+                    flat_track(t, album, &cover_of(&t["album"]))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({"code": 200, "data": {"tracks": tracks}})
+}
+
+/// 歌手专辑列表（指南 §7.1.3）。
+async fn artist_albums(core: &Core, params: Value) -> Value {
+    let Some(id) = get_id(&params) else {
+        return json!({"code": 400, "msg": "missing id"});
+    };
+    let url = format!("{WEB_API}/artists/{id}/albums?include_groups=album,single&limit=30");
+    let body = match web_get(core, url, "artist/albums").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let albums: Vec<Value> = body["items"]
+        .as_array()
+        .map(|items| items.iter().map(map_album_brief).collect())
+        .unwrap_or_default();
+    json!({"code": 200, "data": albums})
+}
+
+/// 歌单详情（指南 §7.3.2）。
+async fn playlist_detail(core: &Core, params: Value) -> Value {
+    let Some(id) = get_id(&params) else {
+        return json!({"code": 400, "msg": "missing id"});
+    };
+    let body = match web_get(core, format!("{WEB_API}/playlists/{id}"), "playlist").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let tracks = playlist_items(&body["tracks"]["items"]);
+    json!({"code": 200, "data": {
+        "id": body["id"],
+        "title": body["name"],
+        "coverUrl": cover_of(&body),
+        "total": body["tracks"]["total"],
+        "author": body["owner"]["display_name"],
+        "description": body["description"],
+        "tracks": tracks,
+    }})
+}
+
+/// 歌单曲目分页（指南 §7.3.3）。
+async fn playlist_tracks(core: &Core, params: Value) -> Value {
+    let Some(id) = get_id(&params) else {
+        return json!({"code": 400, "msg": "missing id"});
+    };
+    let limit = params.get("limit").and_then(|v| v.as_str()).unwrap_or("100");
+    let offset = params.get("offset").and_then(|v| v.as_str()).unwrap_or("0");
+    let url = format!("{WEB_API}/playlists/{id}/tracks?limit={limit}&offset={offset}");
+    let body = match web_get(core, url, "playlist/tracks").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let tracks = playlist_items(&body["items"]);
+    let has_more = !body["next"].is_null();
+    json!({"code": 200, "data": {"tracks": tracks, "hasMore": has_more}})
+}
+
+/// 歌单条目 → 扁平曲目：条目形如 `{"track": {...}}`（新接口可能是 `{"item": {...}}`）。
+fn playlist_items(items: &Value) -> Vec<Value> {
+    items
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|it| {
+                    let t = if it["track"].is_object() { &it["track"] } else { &it["item"] };
+                    if !t.is_object() || t["uri"].is_null() {
+                        return None;
+                    }
+                    let album = t["album"]["name"].as_str().unwrap_or_default();
+                    Some(flat_track(t, album, &cover_of(&t["album"])))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn get_id(params: &Value) -> Option<String> {
@@ -224,6 +446,46 @@ async fn search(core: &Core, params: Value) -> Value {
                             .collect();
                         let n = playlists.len();
                         json!({"code": 200, "result": {"playlists": playlists, "playlistCount": n}})
+                    }
+                    Err(e) => json!({"code": 502, "msg": format!("decode: {e}")}),
+                },
+                Err(e) => json!({"code": 502, "msg": format!("search: {e}")}),
+            }
+        }
+        "100" => {
+            let url = format!("{WEB_API}/search?q={}&type=artist&limit=30", urlencode(keywords));
+            match core.inner.http().get(url).bearer(&token).send().await {
+                Ok(r) => match r.json::<Value>().await {
+                    Ok(v) => {
+                        let items = v["artists"]["items"].as_array().cloned().unwrap_or_default();
+                        let artists: Vec<Value> = items
+                            .iter()
+                            .map(|a| {
+                                json!({
+                                    "id": a["id"],
+                                    "name": a["name"],
+                                    "avatarUrl": cover_of(a),
+                                    "fans": a["followers"]["total"],
+                                })
+                            })
+                            .collect();
+                        let n = artists.len();
+                        json!({"code": 200, "result": {"artists": artists, "artistCount": n}})
+                    }
+                    Err(e) => json!({"code": 502, "msg": format!("decode: {e}")}),
+                },
+                Err(e) => json!({"code": 502, "msg": format!("search: {e}")}),
+            }
+        }
+        "10" => {
+            let url = format!("{WEB_API}/search?q={}&type=album&limit=30", urlencode(keywords));
+            match core.inner.http().get(url).bearer(&token).send().await {
+                Ok(r) => match r.json::<Value>().await {
+                    Ok(v) => {
+                        let items = v["albums"]["items"].as_array().cloned().unwrap_or_default();
+                        let albums: Vec<Value> = items.iter().map(map_album_brief).collect();
+                        let n = albums.len();
+                        json!({"code": 200, "result": {"albums": albums, "albumCount": n}})
                     }
                     Err(e) => json!({"code": 502, "msg": format!("decode: {e}")}),
                 },
