@@ -140,6 +140,13 @@ pub async fn dispatch(core: &Core, method: &str, params: Value) -> Value {
         "song/detail" => song_detail(core, params).await,
         "lyric" | "lyric/new" => lyric(),
         "scrobble" => json!({"code": 200}),
+        // 自检：宿主在「二维码不是 Spotify 的」时可以用它确认**答话的到底是不是本模块**。
+        // 任何别的音源都不会认识这个方法（会回 404/unsupported），一眼可分。
+        "version" | "self/version" => json!({"code": 200, "data": {
+            "module": "cp-spotify-module",
+            "version": env!("CARGO_PKG_VERSION"),
+            "id": "cp.provider.spotify.v2",
+        }}),
         // ---- 曲库浏览（v0.2.0）----
         "album" => album(core, params).await,
         "artist/detail" => artist_detail(core, params).await,

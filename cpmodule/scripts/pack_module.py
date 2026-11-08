@@ -68,8 +68,11 @@ DEFAULT_ABI = {
 def build_manifest(platform: str, version: str, repo: str) -> dict:
     zip_name = f"cp-spotify-module-{platform}-{version}.zip"
     return {
-        "id": "cp.provider.spotify",
-        "name": "Spotify (librespot)",
+        # 换一个 id 是**故意的**：如果设备上已有一个占着 cp.provider.spotify 的
+        # JNI 模块（表现：login/qr/* 回的是网易云的 UUID 二维码），它会把新导入的
+        # 模块顶掉/混合。新 id = 干净的槽位，音源列表里也能一眼区分新旧（名字带 v2）。
+        "id": "cp.provider.spotify.v2",
+        "name": "Spotify (librespot) v2",
         "version": version,
         "type": "jni",
         "entryPoint": ENTRY[platform],
