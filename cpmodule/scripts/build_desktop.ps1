@@ -10,7 +10,7 @@ Set-Location (Join-Path $PSScriptRoot "..")
 $Version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
 Write-Host "Building cp-spotify-module $Version for $Target..."
 
-cargo build --release --features jni --target $Target
+cargo build --release --features sdk --target $Target
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 $Platform = switch -Wildcard ($Target) {

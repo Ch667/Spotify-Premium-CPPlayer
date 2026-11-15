@@ -28,7 +28,7 @@ fi
 export RUSTFLAGS="-Clink-arg=-Wl,-z,max-page-size=16384"
 
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./target/jniLibs \
-    build --release --features jni-android
+    build --release --features sdk-android
 
 STAGE=./target/cp_stage
 rm -rf "$STAGE"

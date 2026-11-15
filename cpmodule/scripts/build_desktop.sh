@@ -17,7 +17,7 @@ TARGET="${TARGET:-$DEFAULT_TARGET}"
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 echo "Building cp-spotify-module $VERSION for $TARGET..."
 
-cargo build --release --features jni --target "$TARGET"
+cargo build --release --features sdk --target "$TARGET"
 
 STAGE=./target/cp_stage
 rm -rf "$STAGE"

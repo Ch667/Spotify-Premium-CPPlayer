@@ -1,13 +1,9 @@
 name: Build Spotify Android module
 
 on:
+  # 仅手动触发：release-module.yml 的 android job 已覆盖同样的构建（且不依赖 setup-android，
+  # 后者在 sdkmanager 接受许可时会因 SDK 预览版条款失败）。
   workflow_dispatch:
-  push:
-    branches: [feat/browser-login, feat/kmp-sdk-v1]
-    paths:
-      - "cpmodule/**"
-      - "sdk/**"
-      - ".github/workflows/build-android-module.yml"
 
 permissions:
   contents: read
