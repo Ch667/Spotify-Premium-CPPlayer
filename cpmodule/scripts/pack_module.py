@@ -14,40 +14,13 @@ import json
 import zipfile
 from pathlib import Path
 
-# 宿主内部方法名 → 本模块端点（Provider Standard v3 §3.2：未映射的方法按原名直传，
-# 这里把实现过的都显式列出来，读 manifest 就能知道这个音源到底支持什么）。
-API_MAP = {
-    "cloudsearch": "search",
-    "song/url/v1": "song/url",
-    "song/url/v1/302": "song/url",
-    "song/download/url/v1": "song/url",
-    "song/detail": "song/detail",
-    "lyric/new": "lyric",
-    # 曲库浏览（v0.2.0 新增）
-    "album": "album",
-    "artist/detail": "artist/detail",
-    "artist/songs": "artist/songs",
-    "artist/top/song": "artist/songs",
-    "artist/album": "artist/albums",
-    "playlist/detail": "playlist/detail",
-    "playlist/track/all": "playlist/track/all",
-    # 账户（设备码授权 → 宿主 QR 通道）
-    "login/qr/key": "login/qr/key",
-    "login/qr/create": "login/qr/create",
-    "login/qr/check": "login/qr/check",
-    "login/status": "login/status",
-    "logout": "logout",
-}
-
-# 能力网格：只声明真正实现的。声明后未列出的能力在 UI 上隐藏（指南 §4），
-# 所以这里刻意不写 comments / cloudDrive / recommend —— Spotify 没有这三样，
-# 留着入口只会点开一片空白。
+# 安装页展示标签（宿主 1.9.x 按 `ProviderCapability.sdkLabels` 映射；
+# 运行期能力以 `MusicProvider.capabilities()` 为准，这里只是展示）。
 CAPABILITIES = [
     "search",
     "playback",
     "albumExplorer",
     "artistExplorer",
-    "qrLogin",
 ]
 
 ENTRY = {
@@ -66,21 +39,19 @@ DEFAULT_ABI = {
 
 
 def build_manifest(platform: str, version: str, repo: str) -> dict:
-    zip_name = f"cp-spotify-module-{platform}-{version}.zip"
+    # kmp-sdk-v1：宿主 v1.8.8 起只认这个契约。`type=native` + `contract` 缺一不可，
+    # 旧的 apiMap / loginMethods / targetAppPackage 已不再生效，不要再写。
+    # id 与旧 JSON 版（cp.provider.spotify.v2）保持不同：旧包不能被新协议加载，
+    # 用新 id 让两者在设备上互不覆盖，也方便一眼区分。
     return {
-        # 换一个 id 是**故意的**：如果设备上已有一个占着 cp.provider.spotify 的
-        # JNI 模块（表现：login/qr/* 回的是网易云的 UUID 二维码），它会把新导入的
-        # 模块顶掉/混合。新 id = 干净的槽位，音源列表里也能一眼区分新旧（名字带 v2）。
-        "id": "cp.provider.spotify.v2",
-        "name": "Spotify (librespot) v2",
+        "id": "cp.provider.spotify.sdk",
+        "name": "Spotify (librespot)",
         "version": version,
-        "type": "jni",
+        "type": "native",
+        "contract": "kmp-sdk-v1",
         "entryPoint": ENTRY[platform],
         "supportedAbis": DEFAULT_ABI[platform],
         "capabilities": CAPABILITIES,
-        "apiMap": API_MAP,
-        # 账户页登录渠道：设备码流程映射到宿主 QR 通道（扫码打开 spotify.com/pair）
-        "loginMethods": ["qr"],
         "updateUrl": f"https://github.com/{repo}/releases/latest/download/version-{platform}.json",
     }
 
@@ -110,12 +81,19 @@ def main() -> None:
 
     manifest = build_manifest(args.platform, args.version, args.repo)
 
-    # 校验产物确实存在
+    # 校验产物确实存在。
+    # 宿主按 File(root, entryPoint) 解析入口，要求它是包内真实文件；Android 的库在
+    # lib/<abi>/ 下，所以 entryPoint 必须写成带路径的形式（NATIVE.md §构建与验证），
+    # 光写文件名会在宿主里报 "entryPoint is missing"。宿主随后按设备 ABI 选 lib/<abi>/。
     if args.platform == "android":
-        abis = [d.name for d in (stage / "lib").glob("*") if (d / manifest["entryPoint"]).is_file()] if (stage / "lib").is_dir() else []
+        lib_dir = stage / "lib"
+        abis = sorted(d.name for d in lib_dir.glob("*") if (d / ENTRY["android"]).is_file()) if lib_dir.is_dir() else []
         if not abis:
-            raise SystemExit(f"no {manifest['entryPoint']} under {stage}/lib/<abi>/")
+            raise SystemExit(f"no {ENTRY['android']} under {stage}/lib/<abi>/")
         manifest["supportedAbis"] = abis
+        # 优先 arm64（现代手机），否则取第一个存在的。
+        primary = "arm64-v8a" if "arm64-v8a" in abis else abis[0]
+        manifest["entryPoint"] = f"lib/{primary}/{ENTRY['android']}"
     else:
         entry = stage / manifest["entryPoint"]
         if not entry.is_file():

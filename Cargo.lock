@@ -435,6 +435,7 @@ version = "0.2.1"
 dependencies = [
  "axum",
  "bytes",
+ "cpplayer-provider-sdk",
  "env_logger",
  "futures-util",
  "jni",
@@ -475,6 +476,14 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows 0.54.0",
+]
+
+[[package]]
+name = "cpplayer-provider-sdk"
+version = "0.1.0"
+dependencies = [
+ "jni",
+ "serde_json",
 ]
 
 [[package]]

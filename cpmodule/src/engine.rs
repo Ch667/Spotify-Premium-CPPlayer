@@ -41,6 +41,14 @@ pub struct Inner {
     http: reqwest::Client,
 }
 
+/// 桌面 Keymaster 的 client_id。
+///
+/// Spotify 只对它开放设备码授权（实测：Android 的 `9a8d2f0c…` 回 `unauthorized_client`）。
+/// librespot 在 Android 上默认选 Android 的 id，所以**设备码与会话都必须显式固定为它**，
+/// 否则 `login/qr/create` 在手机上永远失败。会话用同一个 id，token 才能被接受
+/// （见 librespot `login5.rs`：StoredCredential 走会话 client_id）。
+pub const KEYMASTER_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+
 /// 登录进度常量（与 api.rs 的 login/qr/check 状态映射配套）。
 pub const LOGIN_PENDING: u8 = 0;
 pub const LOGIN_DONE: u8 = 1;
@@ -109,7 +117,7 @@ impl Inner {
     pub async fn connect_and_install(&self, creds: Credentials) -> Result<Session, String> {
         let cache = Cache::new(Some(&self.data_dir), None, Some(&self.data_dir), None)
             .map_err(|e| format!("cache init: {e}"))?;
-        let session = Session::new(SessionConfig::default(), Some(cache));
+        let session = Session::new(session_config(), Some(cache));
         session
             .connect(creds, true)
             .await
@@ -197,8 +205,7 @@ impl Inner {
     /// 验证码已预填、可直接生成二维码）输入 userCode 即可。前提是 client_id
     /// 被 Spotify 启用了该流程（见本仓库 docs/device-authorization.md）。
     pub async fn auth_login_start(self: Arc<Self>) -> Result<(String, String), String> {
-        let client_id = SessionConfig::default().client_id.clone();
-        let client = librespot_oauth::DeviceAuthClientBuilder::new(&client_id, vec!["streaming"])
+        let client = librespot_oauth::DeviceAuthClientBuilder::new(KEYMASTER_CLIENT_ID, vec!["streaming"])
             .build()
             .map_err(|e| format!("device auth unavailable: {e}"))?;
 
@@ -298,6 +305,14 @@ async fn fetch_track(session: &Session, track_id: &str) -> Result<Track, String>
     Track::get(session, &uri).await.map_err(|e| format!("metadata: {e}"))
 }
 
+/// 会话配置：client_id 固定为桌面 Keymaster，其余沿用默认。
+fn session_config() -> SessionConfig {
+    SessionConfig {
+        client_id: KEYMASTER_CLIENT_ID.to_owned(),
+        ..SessionConfig::default()
+    }
+}
+
 /// username → 稳定数字 uid（宿主 LoginStatus 解析要求 Long）。
 fn uid_from_username(name: &str) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -311,6 +326,13 @@ fn uid_from_username(name: &str) -> i64 {
 fn resolve_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CP_SPOTIFY_DATA_DIR") {
         return PathBuf::from(dir);
+    }
+    // Android：应用私有目录（唯一一定可写、且随应用卸载清理的位置）。
+    if let Some(files) = crate::opener::app_files_dir() {
+        let p = files.join("cp_spotify");
+        if std::fs::create_dir_all(&p).is_ok() {
+            return p;
+        }
     }
     if let Ok(cwd) = std::env::current_dir() {
         let p = cwd.join("user_data");

@@ -17,3 +17,6 @@ pub mod stream;
 
 #[cfg(feature = "jni")]
 pub mod jni;
+
+#[cfg(feature = "sdk")]
+pub mod provider;

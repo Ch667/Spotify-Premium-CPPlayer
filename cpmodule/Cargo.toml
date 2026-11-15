@@ -20,10 +20,16 @@ required-features = ["server"]
 
 [features]
 default = []
-# JNI 导出（Android / Desktop 通用）
-jni = ["dep:jni"]
+# kmp-sdk-v1 原生 Provider 导出（Android / Desktop 通用）。与旧 JNI 互斥：只导出新协议符号。
+sdk = ["dep:cpplayer-provider-sdk", "jni-core"]
+# 浏览器跳转所需的 jni crate（不含旧协议符号）
+jni-core = ["dep:jni"]
+# 旧协议 JNI 导出（nativeCallApi），仅 v1.8.5 及更早的宿主使用
+jni = ["jni-core"]
 # Android 变体（预留：与 jni 相同，后续挂 android logger）
 jni-android = ["jni"]
+# Android 新协议构建（kmp-sdk-v1）：只导出 NativeSession 符号
+sdk-android = ["sdk"]
 # 独立调试服务（bin/server.rs）
 server = []
 
@@ -63,6 +69,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }
 jni = { version = "0.21", optional = true }
+cpplayer-provider-sdk = { path = "../sdk", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

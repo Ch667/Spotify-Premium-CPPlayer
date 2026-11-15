@@ -6,19 +6,19 @@
 //! 这里在模块内部用 JNI 直接 `startActivity(ACTION_VIEW)` 调起系统浏览器，
 //! 用户点「扫码登录」后浏览器自动打开授权页；桌面端没有 JavaVM，调用直接跳过。
 
-#[cfg(feature = "jni")]
+#[cfg(feature = "jni-core")]
 use std::sync::OnceLock;
 
-#[cfg(feature = "jni")]
+#[cfg(feature = "jni-core")]
 use jni::objects::{JObject, JValue};
-#[cfg(feature = "jni")]
+#[cfg(feature = "jni-core")]
 use jni::JavaVM;
 
-#[cfg(feature = "jni")]
+#[cfg(feature = "jni-core")]
 static VM: OnceLock<JavaVM> = OnceLock::new();
 
 /// 记录宿主的 JavaVM（JNI 入口每次调用都设置，重复设置无副作用）。
-#[cfg(feature = "jni")]
+#[cfg(feature = "jni-core")]
 pub fn attach_vm(vm: JavaVM) {
     let _ = VM.set(vm);
 }
@@ -29,7 +29,7 @@ pub fn attach_vm(vm: JavaVM) {
 ///   补上 `FLAG_ACTIVITY_NEW_TASK` 后 `startActivity`。
 /// - 其他平台 / 拿不到上下文：返回 `false`，不影响原流程。
 pub fn open_url(url: &str) -> bool {
-    #[cfg(feature = "jni")]
+    #[cfg(feature = "jni-core")]
     {
         let Some(vm) = VM.get() else {
             log::debug!("open_url: no JavaVM (desktop), skip browser launch");
@@ -46,14 +46,14 @@ pub fn open_url(url: &str) -> bool {
             }
         }
     }
-    #[cfg(not(feature = "jni"))]
+    #[cfg(not(feature = "jni-core"))]
     {
         let _ = url;
         false
     }
 }
 
-#[cfg(feature = "jni")]
+#[cfg(feature = "jni-core")]
 fn open_with_vm(vm: &JavaVM, url: &str) -> Result<(), jni::errors::Error> {
     let mut env = vm.attach_current_thread()?;
 
@@ -113,4 +113,51 @@ fn open_with_vm(vm: &JavaVM, url: &str) -> Result<(), jni::errors::Error> {
 
     // 有意保留：本地引用由 JNI 帧回收，模块生命周期内调用次数极少。
     Ok(())
+}
+
+/// 应用私有目录 `Context.getFilesDir()`（Android）。没有 JavaVM（桌面）或取不到时返回 `None`。
+///
+/// Android 上当前目录是 `/`、系统临时目录是 `/data/local/tmp`，应用都写不进去：
+/// 凭据缓存存不下来（每次重启都要重新登录），WAV 临时流文件也建不出来。
+#[cfg(feature = "jni-core")]
+pub fn app_files_dir() -> Option<std::path::PathBuf> {
+    let vm = VM.get()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let at = env.find_class("android/app/ActivityThread").ok()?;
+    let app: JObject = env
+        .call_static_method(&at, "currentApplication", "()Landroid/app/Application;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    if app.is_null() {
+        return None;
+    }
+    let dir: JObject = env.call_method(&app, "getFilesDir", "()Ljava/io/File;", &[]).ok()?.l().ok()?;
+    if dir.is_null() {
+        return None;
+    }
+    let path: JObject = env
+        .call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let path = jni::objects::JString::from(path);
+    let out: String = env.get_string(&path).ok()?.into();
+    Some(std::path::PathBuf::from(out))
+}
+
+#[cfg(not(feature = "jni-core"))]
+pub fn app_files_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// 库被 JVM 加载时记下 `JavaVM`。
+///
+/// 新协议（kmp-sdk-v1）的入口不再经过旧的 `nativeCallApi`，没有地方能顺手 `attach_vm`，
+/// 所以在 `JNI_OnLoad` 里取。SDK 本身不导出这个符号，不会冲突。
+#[cfg(all(feature = "jni-core", feature = "sdk"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) -> jni::sys::jint {
+    attach_vm(vm);
+    jni::sys::JNI_VERSION_1_6
 }

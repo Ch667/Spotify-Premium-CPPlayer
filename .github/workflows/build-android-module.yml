@@ -3,9 +3,10 @@ name: Build Spotify Android module
 on:
   workflow_dispatch:
   push:
-    branches: [feat/browser-login]
+    branches: [feat/browser-login, feat/kmp-sdk-v1]
     paths:
       - "cpmodule/**"
+      - "sdk/**"
       - ".github/workflows/build-android-module.yml"
 
 permissions:
@@ -17,7 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: feat/browser-login
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
@@ -33,7 +33,7 @@ jobs:
         run: |
           cd cpmodule
           export RUSTFLAGS="-Clink-arg=-Wl,-z,max-page-size=16384"
-          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./target/jniLibs build --release --features jni-android
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./target/jniLibs build --release --features sdk-android
       - name: Package module
         run: |
           set -euo pipefail
