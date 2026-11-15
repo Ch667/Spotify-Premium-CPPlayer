@@ -213,6 +213,8 @@ impl MusicProvider for SpotifyProvider {
             Capability::GET_PLAYLIST,
             Capability::GET_PLAYLIST_TRACKS,
             Capability::GET_CURRENT_ACCOUNT,
+            Capability::GET_USER_PLAYLISTS,
+            Capability::GET_USER_ALBUMS,
             Capability::AUTHENTICATE,
         ]
     }
@@ -401,6 +403,34 @@ impl MusicProvider for SpotifyProvider {
         Ok(TrackPage { items, total, has_more })
     }
 
+
+    fn get_user_playlists(&mut self, request: PagedIdRequest, _c: &ProviderContext) -> ProviderResult<PlaylistPage> {
+        require_login(_c)?;
+        let limit = clamp_limit(request.limit);
+        let url = format!("{WEB_API}/me/playlists?limit={limit}&offset={}", request.offset.max(0));
+        let body = web_get(url)?;
+        let items: Vec<Playlist> = body["items"]
+            .as_array()
+            .map(|a| a.iter().filter_map(playlist_of).collect())
+            .unwrap_or_default();
+        let (total, has_more) = page_flags(&body, items.len(), request.offset);
+        Ok(PlaylistPage { items, total, has_more })
+    }
+
+    fn get_user_albums(&mut self, request: UserListRequest, _c: &ProviderContext) -> ProviderResult<AlbumPage> {
+        require_login(_c)?;
+        let limit = clamp_limit(request.limit);
+        let url = format!("{WEB_API}/me/albums?limit={limit}&offset={}", request.offset.max(0));
+        let body = web_get(url)?;
+        // 收藏接口的每一项是 {"album": {...}}，不是裸专辑对象。
+        let items: Vec<Album> = body["items"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|it| album_of(&it["album"])).collect())
+            .unwrap_or_default();
+        let (total, has_more) = page_flags(&body, items.len(), request.offset);
+        Ok(AlbumPage { items, total, has_more })
+    }
+
     // ------------------------------------------------------------ 账号
 
     fn get_current_account(&mut self, _request: Bytes, context: &ProviderContext) -> ProviderResult<AccountSession> {
@@ -439,6 +469,15 @@ impl MusicProvider for SpotifyProvider {
             }
             other => fail(FailureCategory::Unsupported, format!("不支持的登录方式：{other}")),
         }
+    }
+}
+
+/// 个人数据接口必须带登录态；未登录直接报 Authentication，宿主据此提示登录，而不是发一个必然 403 的请求。
+fn require_login(context: &ProviderContext) -> ProviderResult<()> {
+    if context.is_logged_in() {
+        Ok(())
+    } else {
+        fail(FailureCategory::Authentication, "请先登录 Spotify")
     }
 }
 
@@ -674,5 +713,32 @@ mod tests {
         assert_eq!((t.id.as_str(), t.album.as_deref(), t.duration_ms), ("abc", Some("Al"), 1000));
         let no_id = serde_json::json!({"name":"local file","duration_ms":1});
         assert!(track_of(&no_id, None, None).is_none());
+    }
+
+    #[test]
+    fn declares_user_playlist_and_album_capabilities() {
+        let out = call(1, &empty_bytes(), &ctx(None)).unwrap();
+        let caps = Capabilities::read(&mut WireReader::new(&out).unwrap()).unwrap().supported;
+        assert!(caps.iter().any(|c| c == "playlists.user"), "{caps:?}");
+        assert!(caps.iter().any(|c| c == "accounts.albums"), "{caps:?}");
+    }
+
+    #[test]
+    fn user_library_requires_login_and_never_hits_network() {
+        // 未登录（没有 credential）时必须直接报 Authentication，不能去请求 /me/*。
+        let mut p = SpotifyProvider;
+        let req = PagedIdRequest { id: "me".into(), limit: 20, offset: 0 };
+        let err = p.get_user_playlists(req, &ctx(None)).unwrap_err();
+        assert_eq!(err.category, FailureCategory::Authentication);
+        let ureq = UserListRequest { id: "me".into(), limit: 20, offset: 0 };
+        let err = p.get_user_albums(ureq, &ctx(None)).unwrap_err();
+        assert_eq!(err.category, FailureCategory::Authentication);
+    }
+
+    #[test]
+    fn login_scopes_include_library_reads() {
+        assert!(crate::engine::LOGIN_SCOPES.contains(&"user-library-read"));
+        assert!(crate::engine::LOGIN_SCOPES.contains(&"playlist-read-private"));
+        assert!(crate::engine::LOGIN_SCOPES.contains(&"streaming"));
     }
 }

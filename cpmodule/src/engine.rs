@@ -49,6 +49,18 @@ pub struct Inner {
 /// （见 librespot `login5.rs`：StoredCredential 走会话 client_id）。
 pub const KEYMASTER_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 
+/// 设备码授权申请的 scope。`streaming` 用于播放，其余用于读取个人歌单与收藏专辑（`/me/*`）。
+/// 实测桌面 Keymaster 接受整组；未识别的 scope 会让整次授权失败（`invalid_scope`），所以只列已验证的。
+pub const LOGIN_SCOPES: &[&str] = &[
+    "streaming",
+    "playlist-read-private",
+    "playlist-read-collaborative",
+    "user-library-read",
+    "user-read-private",
+    "user-read-email",
+    "user-follow-read",
+];
+
 /// 登录进度常量（与 api.rs 的 login/qr/check 状态映射配套）。
 pub const LOGIN_PENDING: u8 = 0;
 pub const LOGIN_DONE: u8 = 1;
@@ -205,7 +217,7 @@ impl Inner {
     /// 验证码已预填、可直接生成二维码）输入 userCode 即可。前提是 client_id
     /// 被 Spotify 启用了该流程（见本仓库 docs/device-authorization.md）。
     pub async fn auth_login_start(self: Arc<Self>) -> Result<(String, String), String> {
-        let client = librespot_oauth::DeviceAuthClientBuilder::new(KEYMASTER_CLIENT_ID, vec!["streaming"])
+        let client = librespot_oauth::DeviceAuthClientBuilder::new(KEYMASTER_CLIENT_ID, LOGIN_SCOPES.to_vec())
             .build()
             .map_err(|e| format!("device auth unavailable: {e}"))?;
 
