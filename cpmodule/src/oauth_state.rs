@@ -63,8 +63,7 @@ impl OAuthStore {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
         let upgrade_path = dir.join("oauth-scope-upgrade-required");
-        let has_ap_credentials =
-            dir.join("credentials").exists() || dir.join("credentials.json").exists();
+        let has_ap_credentials = dir.join("credentials.json").exists();
         let legacy_grant = saved.as_ref().is_some_and(|s: &SavedToken| {
             !s.scopes.iter().any(|scope| scope == "user-library-read")
                 || !s
@@ -269,7 +268,11 @@ mod tests {
     #[tokio::test]
     async fn old_ap_credentials_require_a_browser_scope_upgrade() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("credentials"), b"not a real credential").unwrap();
+        std::fs::write(
+            dir.path().join("credentials.json"),
+            b"not a real credential",
+        )
+        .unwrap();
         let store = OAuthStore::new(dir.path());
         assert!(store.requires_scope_upgrade());
         let error = store

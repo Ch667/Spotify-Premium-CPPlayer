@@ -709,17 +709,9 @@ impl MusicProvider for SpotifyProvider {
         context: &ProviderContext,
     ) -> ProviderResult<UserProfile> {
         require_login(context)?;
-        let own_id = core()
-            .runtime
-            .block_on(core().inner.ensure_session())
-            .map_err(classify)?
-            .username();
-        let url = if request.id == own_id {
-            format!("{WEB_API}/me")
-        } else {
-            format!("{WEB_API}/users/{}", urlencode(&request.id))
-        };
-        let body = web_get(url)?;
+        // `accounts.session.userId` is the Web API ID returned by `/me`.
+        // Reuse that exact opaque ID; AP usernames are not necessarily identical.
+        let body = web_get(format!("{WEB_API}/users/{}", urlencode(&request.id)))?;
         let id = str_of(&body["id"]).ok_or_else(|| {
             Failure::new(
                 FailureCategory::InvalidResponse,
