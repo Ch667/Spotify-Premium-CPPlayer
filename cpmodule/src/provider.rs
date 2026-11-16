@@ -60,36 +60,70 @@ fn fail<T>(category: FailureCategory, message: impl Into<String>) -> ProviderRes
 /// 引擎错误串 → 宿主失败类别。未登录统一归 `Authentication`，宿主据此提示去登录。
 fn classify(message: String) -> Failure {
     let lower = message.to_lowercase();
-    let category = if lower.contains("not logged in") || lower.contains("token") && lower.contains("401") {
-        FailureCategory::Authentication
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        FailureCategory::Timeout
-    } else if lower.contains("429") || lower.contains("rate") {
-        FailureCategory::RateLimit
-    } else if lower.contains("decode") {
-        FailureCategory::InvalidResponse
-    } else if lower.contains("connect") || lower.contains("dns") || lower.contains("network") {
-        FailureCategory::Network
-    } else {
-        FailureCategory::Runtime
-    };
+    let category =
+        if lower.contains("not logged in") || lower.contains("token") && lower.contains("401") {
+            FailureCategory::Authentication
+        } else if lower.contains("timed out") || lower.contains("timeout") {
+            FailureCategory::Timeout
+        } else if lower.contains("429") || lower.contains("rate") {
+            FailureCategory::RateLimit
+        } else if lower.contains("decode") {
+            FailureCategory::InvalidResponse
+        } else if lower.contains("connect") || lower.contains("dns") || lower.contains("network") {
+            FailureCategory::Network
+        } else {
+            FailureCategory::Runtime
+        };
     Failure::new(category, message)
 }
 
-async fn web_token() -> Result<String, String> {
+fn scope_for_url(url: &str) -> Option<&'static str> {
+    let path = url
+        .strip_prefix(WEB_API)
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    match path {
+        "/me/playlists" => Some("playlist-read-private"),
+        "/me/albums" => Some("user-library-read"),
+        "/me" => Some("user-read-private"),
+        _ => None,
+    }
+}
+
+async fn web_token(scope: Option<&str>) -> Result<String, String> {
+    if let Some(token) = core().inner.oauth.access_token(scope).await? {
+        return Ok(token);
+    }
+    // Legacy installs have AP credentials but no saved OAuth grant. Do not use
+    // librespot's generic token cache for user-library endpoints: its scope set
+    // may be streaming-only, and this can't safely prove requested grants.
+    if scope.is_some() && core().inner.oauth.requires_scope_upgrade() {
+        return Err("Spotify 旧授权缺少个人曲库权限，请重新进行浏览器登录".into());
+    }
     let session = core().inner.ensure_session().await?;
+    let scopes = match scope {
+        Some(scope) => format!("streaming,{scope}"),
+        None => "streaming".to_owned(),
+    };
     let token = session
         .token_provider()
-        .get_token("streaming")
+        .get_token(&scopes)
         .await
-        .map_err(|e| format!("token: {e}"))?;
+        .map_err(|_| "Spotify Web API 授权不可用，请重新进行浏览器登录".to_string())?;
     Ok(token.access_token)
 }
 
 /// GET 一个 Web API 端点并解成 JSON。HTTP 状态码按语义映射成失败类别。
 fn web_get(url: String) -> ProviderResult<Value> {
     core().runtime.block_on(async move {
-        let token = web_token().await.map_err(classify)?;
+        let token = web_token(scope_for_url(&url)).await.map_err(|_| {
+            Failure::new(
+                FailureCategory::Authentication,
+                "Spotify Web API 授权无效或缺少权限，请重新登录",
+            )
+        })?;
         let resp = core()
             .inner
             .http()
@@ -100,7 +134,10 @@ fn web_get(url: String) -> ProviderResult<Value> {
             .map_err(|e| classify(format!("network: {e}")))?;
         let status = resp.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            return fail(FailureCategory::Authentication, format!("Spotify 拒绝访问（HTTP {status}）"));
+            return fail(
+                FailureCategory::Authentication,
+                format!("Spotify 拒绝访问（HTTP {status}）"),
+            );
         }
         if status.as_u16() == 404 {
             return fail(FailureCategory::NotFound, "未找到");
@@ -109,7 +146,10 @@ fn web_get(url: String) -> ProviderResult<Value> {
             return fail(FailureCategory::RateLimit, "请求过于频繁，请稍后重试");
         }
         if !status.is_success() {
-            return fail(FailureCategory::Network, format!("Spotify 返回 HTTP {status}"));
+            return fail(
+                FailureCategory::Network,
+                format!("Spotify 返回 HTTP {status}"),
+            );
         }
         resp.json::<Value>()
             .await
@@ -117,11 +157,98 @@ fn web_get(url: String) -> ProviderResult<Value> {
     })
 }
 
+/// Spotify caps individual pages at 50, while CPPlayer asks for up to 500.
+/// Accumulate raw slots (including unavailable/null entries) so filtered items do
+/// not shift subsequent offsets or silently discard the rest of the library.
+fn library_page(
+    endpoint: &str,
+    limit: i32,
+    offset: i32,
+    mut fetch: impl FnMut(String) -> ProviderResult<Value>,
+) -> ProviderResult<Value> {
+    let wanted = limit.clamp(1, 500) as usize;
+    let mut items = Vec::new();
+    let mut total = None;
+    let mut more = false;
+    while items.len() < wanted {
+        let count = (wanted - items.len()).min(50);
+        let page = fetch(format!(
+            "{WEB_API}{endpoint}?limit={count}&offset={}",
+            offset.max(0) as usize + items.len()
+        ))?;
+        let raw = page["items"].as_array().ok_or_else(|| {
+            Failure::new(
+                FailureCategory::InvalidResponse,
+                "Spotify library items missing",
+            )
+        })?;
+        if raw.len() > count {
+            return fail(
+                FailureCategory::InvalidResponse,
+                "Spotify library page exceeds limit",
+            );
+        }
+        total = page["total"].as_i64().or(total);
+        more = page["next"].as_str().is_some_and(|s| !s.is_empty());
+        if raw.is_empty() {
+            more = false;
+            break;
+        }
+        items.extend(raw.iter().cloned());
+        if !more {
+            break;
+        }
+    }
+    Ok(serde_json::json!({"items":items, "total":total, "next":if more {Some("more")} else {None}}))
+}
+
+fn album_track_page(album_id: &str, limit: i32, offset: i32) -> ProviderResult<Value> {
+    let limit = limit.clamp(1, 50);
+    let mut items = Vec::new();
+    let mut total = None;
+    let mut next_offset = offset.max(0);
+    while items.len() < limit as usize {
+        let count = (limit as usize - items.len()).min(50) as i32;
+        let url = format!(
+            "{WEB_API}/albums/{}/tracks?limit={count}&offset={next_offset}",
+            urlencode(album_id)
+        );
+        let page = web_get(url)?;
+        let page_items = page["items"].as_array().ok_or_else(|| {
+            Failure::new(
+                FailureCategory::InvalidResponse,
+                "Spotify album tracks missing",
+            )
+        })?;
+        if page_items.len() > count as usize {
+            return fail(
+                FailureCategory::InvalidResponse,
+                "Spotify album track page exceeds limit",
+            );
+        }
+        total = page["total"].as_i64().or(total);
+        if page_items.is_empty() {
+            break;
+        }
+        let count = page_items.len() as i32;
+        items.extend(page_items.iter().cloned());
+        next_offset = next_offset.saturating_add(count);
+        if page["next"].is_null() {
+            break;
+        }
+    }
+    Ok(
+        serde_json::json!({"items":items, "total":total, "next":if total.is_some_and(|n| i64::from(next_offset) < n) {Some("more")} else {None}}),
+    )
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -142,7 +269,10 @@ fn artists_of(v: &Value) -> Vec<Artist> {
         .map(|a| {
             a.iter()
                 .filter_map(|x| {
-                    Some(Artist { id: str_of(&x["id"]), name: str_of(&x["name"])? })
+                    Some(Artist {
+                        id: str_of(&x["id"]),
+                        name: str_of(&x["name"])?,
+                    })
                 })
                 .collect()
         })
@@ -152,7 +282,10 @@ fn artists_of(v: &Value) -> Vec<Artist> {
 /// Web API 的曲目对象 → 宿主 Track。`album`/`cover` 在专辑与歌单里由父级补。
 fn track_of(t: &Value, album: Option<&str>, cover: Option<&str>) -> Option<Track> {
     let id = str_of(&t["id"]).or_else(|| {
-        t["uri"].as_str().and_then(|u| u.strip_prefix("spotify:track:")).map(str::to_owned)
+        t["uri"]
+            .as_str()
+            .and_then(|u| u.strip_prefix("spotify:track:"))
+            .map(str::to_owned)
     })?;
     let title = str_of(&t["name"])?;
     let album_name = str_of(&t["album"]["name"]).or_else(|| album.map(str::to_owned));
@@ -190,7 +323,9 @@ fn page_flags(body: &Value, got: usize, offset: i32) -> (Option<i64>, Option<boo
     let has_more = if !body["next"].is_null() {
         true
     } else {
-        total.is_some_and(|t| i64::from(offset.max(0)) + got as i64 > 0 && i64::from(offset.max(0)) + (got as i64) < t)
+        total.is_some_and(|t| {
+            i64::from(offset.max(0)) + got as i64 > 0 && i64::from(offset.max(0)) + (got as i64) < t
+        })
     };
     (total, Some(has_more))
 }
@@ -213,13 +348,18 @@ impl MusicProvider for SpotifyProvider {
             Capability::GET_PLAYLIST,
             Capability::GET_PLAYLIST_TRACKS,
             Capability::GET_CURRENT_ACCOUNT,
+            Capability::GET_USER_PROFILE,
             Capability::GET_USER_PLAYLISTS,
             Capability::GET_USER_ALBUMS,
             Capability::AUTHENTICATE,
         ]
     }
 
-    fn search(&mut self, request: SearchRequest, _c: &ProviderContext) -> ProviderResult<TrackPage> {
+    fn search(
+        &mut self,
+        request: SearchRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<TrackPage> {
         let limit = clamp_limit(request.limit);
         let url = format!(
             "{WEB_API}/search?q={}&type=track&limit={limit}&offset={}",
@@ -233,7 +373,11 @@ impl MusicProvider for SpotifyProvider {
             .map(|a| a.iter().filter_map(|t| track_of(t, None, None)).collect())
             .unwrap_or_default();
         let (total, has_more) = page_flags(tracks, items.len(), request.offset);
-        Ok(TrackPage { items, total, has_more })
+        Ok(TrackPage {
+            items,
+            total,
+            has_more,
+        })
     }
 
     fn get(&mut self, request: IdRequest, _c: &ProviderContext) -> ProviderResult<Track> {
@@ -242,7 +386,11 @@ impl MusicProvider for SpotifyProvider {
             .ok_or_else(|| Failure::new(FailureCategory::NotFound, "曲目不存在"))
     }
 
-    fn resolve(&mut self, request: ResolveRequest, _c: &ProviderContext) -> ProviderResult<MediaResource> {
+    fn resolve(
+        &mut self,
+        request: ResolveRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<MediaResource> {
         // 先让引擎校验曲目可播并预取时长，再返回本地 WAV 流地址。
         // 真正的解码推迟到播放器发起 /stream 请求，避免对着空气解码。
         let id = request.id.clone();
@@ -264,7 +412,11 @@ impl MusicProvider for SpotifyProvider {
         })
     }
 
-    fn search_albums(&mut self, request: SearchRequest, _c: &ProviderContext) -> ProviderResult<AlbumPage> {
+    fn search_albums(
+        &mut self,
+        request: SearchRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<AlbumPage> {
         let limit = clamp_limit(request.limit);
         let url = format!(
             "{WEB_API}/search?q={}&type=album&limit={limit}&offset={}",
@@ -278,14 +430,26 @@ impl MusicProvider for SpotifyProvider {
             .map(|a| a.iter().filter_map(album_of).collect())
             .unwrap_or_default();
         let (total, has_more) = page_flags(albums, items.len(), request.offset);
-        Ok(AlbumPage { items, total, has_more })
+        Ok(AlbumPage {
+            items,
+            total,
+            has_more,
+        })
     }
 
-    fn get_album(&mut self, request: IdRequest, _c: &ProviderContext) -> ProviderResult<AlbumDetails> {
-        let body = web_get(format!("{WEB_API}/albums/{}", urlencode(&request.id)))?;
-        let album = album_of(&body).ok_or_else(|| Failure::new(FailureCategory::NotFound, "专辑不存在"))?;
+    fn get_album(
+        &mut self,
+        request: IdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<AlbumDetails> {
+        let mut body = web_get(format!("{WEB_API}/albums/{}", urlencode(&request.id)))?;
+        let album =
+            album_of(&body).ok_or_else(|| Failure::new(FailureCategory::NotFound, "专辑不存在"))?;
         let name = album.title.clone();
         let cover = album.cover_url.clone();
+        if body["tracks"]["next"].is_string() {
+            body["tracks"] = album_track_page(&request.id, 50, 0)?;
+        }
         let tracks = body["tracks"]["items"]
             .as_array()
             .map(|a| {
@@ -304,7 +468,11 @@ impl MusicProvider for SpotifyProvider {
         Ok(AlbumDetails { album, tracks })
     }
 
-    fn search_artists(&mut self, request: SearchRequest, _c: &ProviderContext) -> ProviderResult<ArtistPage> {
+    fn search_artists(
+        &mut self,
+        request: SearchRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<ArtistPage> {
         let limit = clamp_limit(request.limit);
         let url = format!(
             "{WEB_API}/search?q={}&type=artist&limit={limit}&offset={}",
@@ -318,26 +486,50 @@ impl MusicProvider for SpotifyProvider {
             .map(|a| a.iter().filter_map(catalog_artist_of).collect())
             .unwrap_or_default();
         let (total, has_more) = page_flags(artists, items.len(), request.offset);
-        Ok(ArtistPage { items, total, has_more })
+        Ok(ArtistPage {
+            items,
+            total,
+            has_more,
+        })
     }
 
-    fn get_artist(&mut self, request: IdRequest, _c: &ProviderContext) -> ProviderResult<CatalogArtist> {
+    fn get_artist(
+        &mut self,
+        request: IdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<CatalogArtist> {
         let body = web_get(format!("{WEB_API}/artists/{}", urlencode(&request.id)))?;
-        catalog_artist_of(&body).ok_or_else(|| Failure::new(FailureCategory::NotFound, "歌手不存在"))
+        catalog_artist_of(&body)
+            .ok_or_else(|| Failure::new(FailureCategory::NotFound, "歌手不存在"))
     }
 
-    fn get_artist_tracks(&mut self, request: PagedIdRequest, _c: &ProviderContext) -> ProviderResult<TrackPage> {
+    fn get_artist_tracks(
+        &mut self,
+        request: PagedIdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<TrackPage> {
         // Spotify 只提供「热门单曲」（最多 10 首），不分页。
-        let body = web_get(format!("{WEB_API}/artists/{}/top-tracks", urlencode(&request.id)))?;
+        let body = web_get(format!(
+            "{WEB_API}/artists/{}/top-tracks",
+            urlencode(&request.id)
+        ))?;
         let items: Vec<Track> = body["tracks"]
             .as_array()
             .map(|a| a.iter().filter_map(|t| track_of(t, None, None)).collect())
             .unwrap_or_default();
         let total = Some(items.len() as i64);
-        Ok(TrackPage { items, total, has_more: Some(false) })
+        Ok(TrackPage {
+            items,
+            total,
+            has_more: Some(false),
+        })
     }
 
-    fn get_artist_albums(&mut self, request: PagedIdRequest, _c: &ProviderContext) -> ProviderResult<AlbumPage> {
+    fn get_artist_albums(
+        &mut self,
+        request: PagedIdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<AlbumPage> {
         let limit = clamp_limit(request.limit);
         let url = format!(
             "{WEB_API}/artists/{}/albums?include_groups=album,single&limit={limit}&offset={}",
@@ -350,10 +542,18 @@ impl MusicProvider for SpotifyProvider {
             .map(|a| a.iter().filter_map(album_of).collect())
             .unwrap_or_default();
         let (total, has_more) = page_flags(&body, items.len(), request.offset);
-        Ok(AlbumPage { items, total, has_more })
+        Ok(AlbumPage {
+            items,
+            total,
+            has_more,
+        })
     }
 
-    fn search_playlists(&mut self, request: SearchRequest, _c: &ProviderContext) -> ProviderResult<PlaylistPage> {
+    fn search_playlists(
+        &mut self,
+        request: SearchRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<PlaylistPage> {
         let limit = clamp_limit(request.limit);
         let url = format!(
             "{WEB_API}/search?q={}&type=playlist&limit={limit}&offset={}",
@@ -368,15 +568,27 @@ impl MusicProvider for SpotifyProvider {
             .map(|a| a.iter().filter_map(playlist_of).collect())
             .unwrap_or_default();
         let (total, has_more) = page_flags(playlists, items.len(), request.offset);
-        Ok(PlaylistPage { items, total, has_more })
+        Ok(PlaylistPage {
+            items,
+            total,
+            has_more,
+        })
     }
 
-    fn get_playlist(&mut self, request: IdRequest, _c: &ProviderContext) -> ProviderResult<Playlist> {
+    fn get_playlist(
+        &mut self,
+        request: IdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<Playlist> {
         let body = web_get(format!("{WEB_API}/playlists/{}", urlencode(&request.id)))?;
         playlist_of(&body).ok_or_else(|| Failure::new(FailureCategory::NotFound, "歌单不存在"))
     }
 
-    fn get_playlist_tracks(&mut self, request: PagedIdRequest, _c: &ProviderContext) -> ProviderResult<TrackPage> {
+    fn get_playlist_tracks(
+        &mut self,
+        request: PagedIdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<TrackPage> {
         let limit = clamp_limit(request.limit);
         let url = format!(
             "{WEB_API}/playlists/{}/tracks?limit={limit}&offset={}",
@@ -390,7 +602,11 @@ impl MusicProvider for SpotifyProvider {
             .map(|a| {
                 a.iter()
                     .filter_map(|it| {
-                        let t = if it["track"].is_object() { &it["track"] } else { &it["item"] };
+                        let t = if it["track"].is_object() {
+                            &it["track"]
+                        } else {
+                            &it["item"]
+                        };
                         if !t.is_object() {
                             return None;
                         }
@@ -400,53 +616,135 @@ impl MusicProvider for SpotifyProvider {
             })
             .unwrap_or_default();
         let (total, has_more) = page_flags(&body, items.len(), request.offset);
-        Ok(TrackPage { items, total, has_more })
+        Ok(TrackPage {
+            items,
+            total,
+            has_more,
+        })
     }
 
-
-    fn get_user_playlists(&mut self, request: PagedIdRequest, _c: &ProviderContext) -> ProviderResult<PlaylistPage> {
+    fn get_user_playlists(
+        &mut self,
+        request: PagedIdRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<PlaylistPage> {
         require_login(_c)?;
-        let limit = clamp_limit(request.limit);
-        let url = format!("{WEB_API}/me/playlists?limit={limit}&offset={}", request.offset.max(0));
-        let body = web_get(url)?;
+        let body = library_page("/me/playlists", request.limit, request.offset, web_get)?;
         let items: Vec<Playlist> = body["items"]
             .as_array()
             .map(|a| a.iter().filter_map(playlist_of).collect())
             .unwrap_or_default();
-        let (total, has_more) = page_flags(&body, items.len(), request.offset);
-        Ok(PlaylistPage { items, total, has_more })
+        Ok(PlaylistPage {
+            items,
+            total: body["total"].as_i64(),
+            has_more: Some(body["next"].as_str().is_some_and(|s| !s.is_empty())),
+        })
     }
 
-    fn get_user_albums(&mut self, request: UserListRequest, _c: &ProviderContext) -> ProviderResult<AlbumPage> {
+    fn get_user_albums(
+        &mut self,
+        request: UserListRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<AlbumPage> {
         require_login(_c)?;
-        let limit = clamp_limit(request.limit);
-        let url = format!("{WEB_API}/me/albums?limit={limit}&offset={}", request.offset.max(0));
-        let body = web_get(url)?;
+        let body = library_page("/me/albums", request.limit, request.offset, web_get)?;
         // 收藏接口的每一项是 {"album": {...}}，不是裸专辑对象。
         let items: Vec<Album> = body["items"]
             .as_array()
             .map(|a| a.iter().filter_map(|it| album_of(&it["album"])).collect())
             .unwrap_or_default();
-        let (total, has_more) = page_flags(&body, items.len(), request.offset);
-        Ok(AlbumPage { items, total, has_more })
+        Ok(AlbumPage {
+            items,
+            total: body["total"].as_i64(),
+            has_more: Some(body["next"].as_str().is_some_and(|s| !s.is_empty())),
+        })
     }
 
     // ------------------------------------------------------------ 账号
 
-    fn get_current_account(&mut self, _request: Bytes, context: &ProviderContext) -> ProviderResult<AccountSession> {
+    fn get_current_account(
+        &mut self,
+        _request: Bytes,
+        context: &ProviderContext,
+    ) -> ProviderResult<AccountSession> {
         // 宿主没有保存凭据 ⇒ 肯定没登录，不必去连 Spotify。
-        if !context.is_logged_in() {
-            return Ok(AccountSession { logged_in: false, user_id: None, nickname: None, avatar_url: None });
+        if !context.is_logged_in() || core().inner.oauth.requires_scope_upgrade() {
+            return Ok(AccountSession {
+                logged_in: false,
+                user_id: None,
+                nickname: None,
+                avatar_url: None,
+            });
         }
-        let (logged, _uid, name) = core().runtime.block_on(core().inner.login_status());
+        let (logged, _uid, _username) = core().runtime.block_on(core().inner.login_status());
         if !logged {
-            return Ok(AccountSession { logged_in: false, user_id: None, nickname: None, avatar_url: None });
+            return Ok(AccountSession {
+                logged_in: false,
+                user_id: None,
+                nickname: None,
+                avatar_url: None,
+            });
         }
-        // Spotify 的 username 是字符串且稳定，直接作为不透明 user id。
-        Ok(AccountSession { logged_in: true, user_id: name.clone(), nickname: name, avatar_url: None })
+        // AP session usernames can be absent for token-authenticated Android
+        // sessions. The host uses user_id to load its profile and per-account
+        // library, so return Spotify's stable Web API identity instead.
+        let profile = web_get(format!("{WEB_API}/me"))?;
+        let id = str_of(&profile["id"]).ok_or_else(|| {
+            Failure::new(
+                FailureCategory::InvalidResponse,
+                "Spotify profile identity missing",
+            )
+        })?;
+        Ok(AccountSession {
+            logged_in: true,
+            user_id: Some(id),
+            nickname: str_of(&profile["display_name"]),
+            avatar_url: cover_of(&profile),
+        })
     }
 
-    fn authenticate(&mut self, request: AuthActionRequest, _c: &ProviderContext) -> ProviderResult<AuthActionResult> {
+    fn get_user_profile(
+        &mut self,
+        request: UserRequest,
+        context: &ProviderContext,
+    ) -> ProviderResult<UserProfile> {
+        require_login(context)?;
+        let own_id = core()
+            .runtime
+            .block_on(core().inner.ensure_session())
+            .map_err(classify)?
+            .username();
+        let url = if request.id == own_id {
+            format!("{WEB_API}/me")
+        } else {
+            format!("{WEB_API}/users/{}", urlencode(&request.id))
+        };
+        let body = web_get(url)?;
+        let id = str_of(&body["id"]).ok_or_else(|| {
+            Failure::new(
+                FailureCategory::InvalidResponse,
+                "Spotify profile identity missing",
+            )
+        })?;
+        Ok(UserProfile {
+            nickname: str_of(&body["display_name"]).unwrap_or_else(|| id.clone()),
+            id,
+            avatar_url: cover_of(&body),
+            signature: None,
+            playlist_count: 0,
+            follows: 0,
+            followeds: body["followers"]["total"]
+                .as_i64()
+                .unwrap_or(0)
+                .clamp(0, i32::MAX as i64) as i32,
+        })
+    }
+
+    fn authenticate(
+        &mut self,
+        request: AuthActionRequest,
+        _c: &ProviderContext,
+    ) -> ProviderResult<AuthActionResult> {
         match request.action.as_str() {
             // 浏览器授权：返回 spotify.com/pair?code=… ，宿主在系统浏览器里打开。
             "webview.url" | "qr.create" => start_login(request.action == "qr.create"),
@@ -467,7 +765,10 @@ impl MusicProvider for SpotifyProvider {
                 core().runtime.block_on(core().inner.logout());
                 Ok(ok_result())
             }
-            other => fail(FailureCategory::Unsupported, format!("不支持的登录方式：{other}")),
+            other => fail(
+                FailureCategory::Unsupported,
+                format!("不支持的登录方式：{other}"),
+            ),
         }
     }
 }
@@ -542,7 +843,9 @@ fn check_login() -> ProviderResult<AuthActionResult> {
             result.cookie = Some(SESSION_MARK.to_owned());
         }
         LOGIN_PENDING => {
-            let alive = core().runtime.block_on(async { inner.login.lock().await.is_some() });
+            let alive = core()
+                .runtime
+                .block_on(async { inner.login.lock().await.is_some() });
             let code = if alive { LOGIN_STATUS_WAITING } else { 800 };
             result.success = alive;
             result.code = Some(code);
@@ -562,13 +865,21 @@ fn check_login() -> ProviderResult<AuthActionResult> {
 fn catalog_artist_of(a: &Value) -> Option<CatalogArtist> {
     let genres: Vec<String> = a["genres"]
         .as_array()
-        .map(|g| g.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+        .map(|g| {
+            g.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
     Some(CatalogArtist {
         id: str_of(&a["id"])?,
         name: str_of(&a["name"])?,
         avatar_url: cover_of(a),
-        description: if genres.is_empty() { None } else { Some(genres.join(" / ")) },
+        description: if genres.is_empty() {
+            None
+        } else {
+            Some(genres.join(" / "))
+        },
         aliases: genres,
         album_count: None,
         track_count: None,
@@ -593,7 +904,7 @@ fn playlist_of(p: &Value) -> Option<Playlist> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cpplayer_provider_sdk::{dispatch, WireReader, WireWriter};
+    use cpplayer_provider_sdk::{WireReader, WireWriter, dispatch};
 
     /// `login_state` 是进程内全局量，会改它的测试必须串行，否则互相踩。
     static LOGIN_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -643,8 +954,16 @@ mod tests {
     #[test]
     fn declares_the_capabilities_it_implements() {
         let out = call(1, &empty_bytes(), &ctx(None)).unwrap();
-        let caps = Capabilities::read(&mut WireReader::new(&out).unwrap()).unwrap().supported;
-        for must in ["tracks.search", "tracks.resolve", "albums.get", "accounts.session", "auth.actions"] {
+        let caps = Capabilities::read(&mut WireReader::new(&out).unwrap())
+            .unwrap()
+            .supported;
+        for must in [
+            "tracks.search",
+            "tracks.resolve",
+            "albums.get",
+            "accounts.session",
+            "auth.actions",
+        ] {
             assert!(caps.iter().any(|c| c == must), "missing {must}: {caps:?}");
         }
         // 没实现的不能声明：评论 / 云盘之类应该是 Unsupported，而不是空页。
@@ -697,6 +1016,42 @@ mod tests {
     }
 
     #[test]
+    fn personal_library_pages_are_bounded_to_spotify_api_limit_without_losing_items() {
+        let mut calls = Vec::new();
+        let body = library_page("/me/playlists", 120, 40, |url| {
+            calls.push(url.clone());
+            let offset = url.split("offset=").nth(1).unwrap().parse::<i32>().unwrap();
+            let count = url.split("limit=").nth(1).unwrap().split('&').next().unwrap().parse::<i32>().unwrap();
+            let items: Vec<_> = (offset..offset + count).map(|n| serde_json::json!({"id":n})).collect();
+            Ok(serde_json::json!({"items":items,"total":200,"next":if offset + count < 200 {Some("next")} else {None}}))
+        }).unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.iter().filter(|u| u.contains("limit=50")).count(), 2);
+        assert!(calls[2].contains("limit=20"));
+        assert!(calls[0].contains("offset=40"));
+        assert!(calls[1].contains("offset=90"));
+        assert!(calls[2].contains("offset=140"));
+        assert_eq!(body["items"].as_array().unwrap().len(), 120);
+        assert_eq!(body["items"][0]["id"], 40);
+        assert_eq!(body["items"][119]["id"], 159);
+        assert_eq!(body["total"], 200);
+        assert!(body["next"].is_string());
+    }
+
+    #[test]
+    fn personal_library_pages_preserve_raw_offsets_when_entries_are_filtered_later() {
+        let body = library_page("/me/albums", 60, 100, |url| {
+            let offset = url.split("offset=").nth(1).unwrap().parse::<i32>().unwrap();
+            let count = url.split("limit=").nth(1).unwrap().split('&').next().unwrap().parse::<i32>().unwrap();
+            let items: Vec<_> = (offset..offset + count).map(|n| if n == 105 {serde_json::Value::Null} else {serde_json::json!({"album":{"id":n}})}).collect();
+            Ok(serde_json::json!({"items":items,"total":200,"next":if offset + count < 200 {Some("next")} else {None}}))
+        }).unwrap();
+        assert_eq!(body["items"].as_array().unwrap().len(), 60);
+        assert!(body["items"][5].is_null());
+        assert_eq!(body["items"][10]["album"]["id"], 110);
+    }
+
+    #[test]
     fn page_flags_use_next_and_total() {
         let more = serde_json::json!({"total": 100, "next": "https://x"});
         assert_eq!(page_flags(&more, 20, 0), (Some(100), Some(true)));
@@ -710,7 +1065,10 @@ mod tests {
     fn track_mapping_skips_unplayable_entries() {
         let ok = serde_json::json!({"id":"abc","name":"S","artists":[{"id":"1","name":"A"}],"duration_ms":1000,"album":{"name":"Al","images":[{"url":"https://i/x.jpg"}]}});
         let t = track_of(&ok, None, None).unwrap();
-        assert_eq!((t.id.as_str(), t.album.as_deref(), t.duration_ms), ("abc", Some("Al"), 1000));
+        assert_eq!(
+            (t.id.as_str(), t.album.as_deref(), t.duration_ms),
+            ("abc", Some("Al"), 1000)
+        );
         let no_id = serde_json::json!({"name":"local file","duration_ms":1});
         assert!(track_of(&no_id, None, None).is_none());
     }
@@ -718,7 +1076,9 @@ mod tests {
     #[test]
     fn declares_user_playlist_and_album_capabilities() {
         let out = call(1, &empty_bytes(), &ctx(None)).unwrap();
-        let caps = Capabilities::read(&mut WireReader::new(&out).unwrap()).unwrap().supported;
+        let caps = Capabilities::read(&mut WireReader::new(&out).unwrap())
+            .unwrap()
+            .supported;
         assert!(caps.iter().any(|c| c == "playlists.user"), "{caps:?}");
         assert!(caps.iter().any(|c| c == "accounts.albums"), "{caps:?}");
     }
@@ -727,10 +1087,18 @@ mod tests {
     fn user_library_requires_login_and_never_hits_network() {
         // 未登录（没有 credential）时必须直接报 Authentication，不能去请求 /me/*。
         let mut p = SpotifyProvider;
-        let req = PagedIdRequest { id: "me".into(), limit: 20, offset: 0 };
+        let req = PagedIdRequest {
+            id: "me".into(),
+            limit: 20,
+            offset: 0,
+        };
         let err = p.get_user_playlists(req, &ctx(None)).unwrap_err();
         assert_eq!(err.category, FailureCategory::Authentication);
-        let ureq = UserListRequest { id: "me".into(), limit: 20, offset: 0 };
+        let ureq = UserListRequest {
+            id: "me".into(),
+            limit: 20,
+            offset: 0,
+        };
         let err = p.get_user_albums(ureq, &ctx(None)).unwrap_err();
         assert_eq!(err.category, FailureCategory::Authentication);
     }

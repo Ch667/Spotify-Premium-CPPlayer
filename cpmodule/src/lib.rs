@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod engine;
+pub mod oauth_state;
 pub mod opener;
 pub mod stream;
 

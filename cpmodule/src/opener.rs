@@ -10,9 +10,9 @@
 use std::sync::OnceLock;
 
 #[cfg(feature = "jni-core")]
-use jni::objects::{JObject, JValue};
-#[cfg(feature = "jni-core")]
 use jni::JavaVM;
+#[cfg(feature = "jni-core")]
+use jni::objects::{JObject, JValue};
 
 #[cfg(feature = "jni-core")]
 static VM: OnceLock<JavaVM> = OnceLock::new();
@@ -125,14 +125,23 @@ pub fn app_files_dir() -> Option<std::path::PathBuf> {
     let mut env = vm.attach_current_thread().ok()?;
     let at = env.find_class("android/app/ActivityThread").ok()?;
     let app: JObject = env
-        .call_static_method(&at, "currentApplication", "()Landroid/app/Application;", &[])
+        .call_static_method(
+            &at,
+            "currentApplication",
+            "()Landroid/app/Application;",
+            &[],
+        )
         .ok()?
         .l()
         .ok()?;
     if app.is_null() {
         return None;
     }
-    let dir: JObject = env.call_method(&app, "getFilesDir", "()Ljava/io/File;", &[]).ok()?.l().ok()?;
+    let dir: JObject = env
+        .call_method(&app, "getFilesDir", "()Ljava/io/File;", &[])
+        .ok()?
+        .l()
+        .ok()?;
     if dir.is_null() {
         return None;
     }

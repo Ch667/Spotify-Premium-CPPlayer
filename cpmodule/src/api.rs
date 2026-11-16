@@ -7,15 +7,16 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::Path;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::Core;
-use crate::stream::BYTES_PER_MS;
+use crate::stream::{position_ms_for_byte, stream_total_bytes};
 
 const WEB_API: &str = "https://api.spotify.com/v1";
 
@@ -66,67 +67,120 @@ async fn call_api(Path(method): Path<String>, body: String) -> Response {
     Json(resp).into_response()
 }
 
-/// Range: `bytes=a-b` / `bytes=a-` / `bytes=-suffix`；只取起点（seek 语义，见 stream.rs）。
-fn parse_range(h: Option<&HeaderValue>) -> Option<u64> {
-    let raw = h?.to_str().ok()?.strip_prefix("bytes=")?.to_string();
-    if let Some(start) = raw.strip_suffix('-') {
-        return start.parse::<u64>().ok();
+/// Single byte range, expressed as [start,end). Unsupported/malformed ranges
+/// are ignored (HTTP permits a full 200 response); valid unsatisfiable ones get 416.
+fn parse_range(h: Option<&HeaderValue>, total: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(raw) = h
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes="))
+    else {
+        return Ok(None);
+    };
+    if raw.contains(',') {
+        return Ok(None);
     }
-    if let Some(suffix) = raw.strip_prefix('-') {
-        let _ = suffix; // 后缀区间对「按位置重启」的流无意义，忽略
-        return None;
+    let Some((a, b)) = raw.trim().split_once('-') else {
+        return Ok(None);
+    };
+    if a.is_empty() {
+        let Ok(suffix) = b.parse::<u64>() else {
+            return Ok(None);
+        };
+        if suffix == 0 || total == 0 {
+            return Err(());
+        }
+        return Ok(Some((total.saturating_sub(suffix), total)));
     }
-    raw.split('-')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
+    let Ok(start) = a.parse::<u64>() else {
+        return Ok(None);
+    };
+    let end = if b.is_empty() {
+        total
+    } else {
+        let Ok(last) = b.parse::<u64>() else {
+            return Ok(None);
+        };
+        if last < start {
+            return Ok(None);
+        }
+        last.saturating_add(1).min(total)
+    };
+    if start >= total || end <= start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
 }
 
-async fn stream_track(Path(track_id): Path<String>, headers: HeaderMap) -> Response {
-    let core = Core::global();
-    // 每次带 Range 的请求都从对应位置重启播放（seek 语义）。
-    // 起点先用一个宽松上限做截断，实际总长由新流决定。
-    let start_bytes = parse_range(headers.get(header::RANGE)).unwrap_or(0);
-    let position_ms = start_bytes.saturating_sub(44) / BYTES_PER_MS;
-
-    let stream = match core.inner.play_from(&track_id, position_ms.min(u32::MAX as u64) as u32).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"code": 502, "msg": e})),
-            )
-                .into_response()
-        }
-    };
-
-    let total = stream.total();
-    let body_start = 44u64;
-    let is_partial = position_ms > 0 && start_bytes > body_start && start_bytes < total;
-    let status = if is_partial {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    };
-
+fn stream_response(body: axum::body::Body, total: u64, range: Option<(u64, u64)>) -> Response {
+    let (start, end) = range.unwrap_or((0, total));
     let mut resp = (
-        status,
+        if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        },
         [
             (header::CONTENT_TYPE, "audio/wav"),
             (header::ACCEPT_RANGES, "bytes"),
         ],
-        axum::body::Body::from_stream(stream.read_sequential(body_start, total)),
+        body,
     )
         .into_response();
-
-    let len = total - body_start;
     resp.headers_mut()
-        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-    if is_partial {
-        if let Ok(v) = HeaderValue::from_str(&format!("bytes {body_start}-{}/{}", total - 1, total)) {
-            resp.headers_mut().insert(header::CONTENT_RANGE, v);
-        }
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(end - start));
+    if range.is_some() {
+        resp.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{}/{}", end - 1, total)).unwrap(),
+        );
     }
     resp
+}
+
+async fn stream_track(
+    Path(track_id): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let core = Core::global();
+    // Metadata and range validation must precede interrupting active playback.
+    let duration = match core.inner.track_duration(&track_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({"code":502,"msg":e}))).into_response();
+        }
+    };
+    let total = stream_total_bytes(duration);
+    // HEAD has GET headers, but must never start/replace a decoder; Range is GET-only.
+    if method == Method::HEAD {
+        return stream_response(axum::body::Body::empty(), total, None);
+    }
+    let range = match parse_range(headers.get(header::RANGE), total) {
+        Ok(range) => range,
+        Err(()) => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+            )
+                .into_response();
+        }
+    };
+    let (start, end) = range.unwrap_or((0, total));
+    let stream = match core
+        .inner
+        .play_from(&track_id, duration, position_ms_for_byte(start))
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({"code":502,"msg":e}))).into_response();
+        }
+    };
+    stream_response(
+        Body::from_stream(stream.read_sequential(start, end)),
+        total,
+        range,
+    )
 }
 
 // ---------------------------------------------------------------- API 分发
@@ -290,7 +344,13 @@ async fn artist_songs(core: &Core, params: Value) -> Value {
     let Some(id) = get_id(&params) else {
         return json!({"code": 400, "msg": "missing id"});
     };
-    let body = match web_get(core, format!("{WEB_API}/artists/{id}/top-tracks"), "artist/top-tracks").await {
+    let body = match web_get(
+        core,
+        format!("{WEB_API}/artists/{id}/top-tracks"),
+        "artist/top-tracks",
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -352,7 +412,10 @@ async fn playlist_tracks(core: &Core, params: Value) -> Value {
     let Some(id) = get_id(&params) else {
         return json!({"code": 400, "msg": "missing id"});
     };
-    let limit = params.get("limit").and_then(|v| v.as_str()).unwrap_or("100");
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_str())
+        .unwrap_or("100");
     let offset = params.get("offset").and_then(|v| v.as_str()).unwrap_or("0");
     let url = format!("{WEB_API}/playlists/{id}/tracks?limit={limit}&offset={offset}");
     let body = match web_get(core, url, "playlist/tracks").await {
@@ -371,7 +434,11 @@ fn playlist_items(items: &Value) -> Vec<Value> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|it| {
-                    let t = if it["track"].is_object() { &it["track"] } else { &it["item"] };
+                    let t = if it["track"].is_object() {
+                        &it["track"]
+                    } else {
+                        &it["item"]
+                    };
                     if !t.is_object() || t["uri"].is_null() {
                         return None;
                     }
@@ -384,11 +451,14 @@ fn playlist_items(items: &Value) -> Vec<Value> {
 }
 
 fn get_id(params: &Value) -> Option<String> {
-    params.get("id").map(|v| match v {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        _ => String::new(),
-    }).filter(|s| !s.is_empty())
+    params
+        .get("id")
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        })
+        .filter(|s| !s.is_empty())
 }
 
 async fn song_url(core: &Core, params: Value) -> Value {
@@ -418,7 +488,10 @@ async fn search(core: &Core, params: Value) -> Value {
 
     match stype {
         "1" => {
-            let url = format!("{WEB_API}/search?q={}&type=track&limit=30", urlencode(keywords));
+            let url = format!(
+                "{WEB_API}/search?q={}&type=track&limit=30",
+                urlencode(keywords)
+            );
             match core.inner.http().get(url).bearer(&token).send().await {
                 Ok(r) => match r.json::<Value>().await {
                     Ok(v) => {
@@ -433,11 +506,17 @@ async fn search(core: &Core, params: Value) -> Value {
             }
         }
         "1000" => {
-            let url = format!("{WEB_API}/search?q={}&type=playlist&limit=20", urlencode(keywords));
+            let url = format!(
+                "{WEB_API}/search?q={}&type=playlist&limit=20",
+                urlencode(keywords)
+            );
             match core.inner.http().get(url).bearer(&token).send().await {
                 Ok(r) => match r.json::<Value>().await {
                     Ok(v) => {
-                        let items = v["playlists"]["items"].as_array().cloned().unwrap_or_default();
+                        let items = v["playlists"]["items"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
                         let playlists: Vec<Value> = items
                             .iter()
                             .filter_map(|p| {
@@ -460,11 +539,17 @@ async fn search(core: &Core, params: Value) -> Value {
             }
         }
         "100" => {
-            let url = format!("{WEB_API}/search?q={}&type=artist&limit=30", urlencode(keywords));
+            let url = format!(
+                "{WEB_API}/search?q={}&type=artist&limit=30",
+                urlencode(keywords)
+            );
             match core.inner.http().get(url).bearer(&token).send().await {
                 Ok(r) => match r.json::<Value>().await {
                     Ok(v) => {
-                        let items = v["artists"]["items"].as_array().cloned().unwrap_or_default();
+                        let items = v["artists"]["items"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
                         let artists: Vec<Value> = items
                             .iter()
                             .map(|a| {
@@ -485,7 +570,10 @@ async fn search(core: &Core, params: Value) -> Value {
             }
         }
         "10" => {
-            let url = format!("{WEB_API}/search?q={}&type=album&limit=30", urlencode(keywords));
+            let url = format!(
+                "{WEB_API}/search?q={}&type=album&limit=30",
+                urlencode(keywords)
+            );
             match core.inner.http().get(url).bearer(&token).send().await {
                 Ok(r) => match r.json::<Value>().await {
                     Ok(v) => {
@@ -521,7 +609,11 @@ async fn song_detail(core: &Core, params: Value) -> Value {
         Ok(r) => match r.json::<Value>().await {
             Ok(v) => {
                 let tracks = v["tracks"].as_array().cloned().unwrap_or_default();
-                let songs: Vec<Value> = tracks.iter().filter(|t| !t.is_null()).map(map_track).collect();
+                let songs: Vec<Value> = tracks
+                    .iter()
+                    .filter(|t| !t.is_null())
+                    .map(map_track)
+                    .collect();
                 json!({"code": 200, "songs": songs})
             }
             Err(e) => json!({"code": 502, "msg": format!("decode: {e}")}),
@@ -553,14 +645,9 @@ async fn auth_status(core: &Core) -> Value {
 
 fn auth_logout(core: &Core) -> Value {
     let dir = &core.inner.data_dir;
-    let removed = [
-        dir.join("credentials"),
-        dir.join("credentials.json"),
-    ]
-    .iter()
-    .any(|p| {
-        std::fs::remove_file(p).is_ok() || std::fs::remove_dir_all(p).is_ok()
-    });
+    let removed = [dir.join("credentials"), dir.join("credentials.json")]
+        .iter()
+        .any(|p| std::fs::remove_file(p).is_ok() || std::fs::remove_dir_all(p).is_ok());
     json!({"code": 200, "data": {"removed": removed}})
 }
 
@@ -597,7 +684,11 @@ async fn qr_create(core: &Core) -> Value {
 /// 801/802 等待（宿主文案「请在手机上确认」）、803 成功（带 cookie 占位）、800 过期。
 async fn qr_check(core: &Core) -> Value {
     use crate::engine::{LOGIN_DONE, LOGIN_IDLE, LOGIN_PENDING};
-    match core.inner.login_state.load(std::sync::atomic::Ordering::SeqCst) {
+    match core
+        .inner
+        .login_state
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         LOGIN_DONE => json!({"code": 803, "cookie": "spotify=ok"}),
         LOGIN_PENDING => {
             // 有进行中的枚码才报等待；槽位已空（刚过期）按过期处理。
@@ -675,6 +766,54 @@ fn map_track(t: &Value) -> Value {
         },
         "dt": t["duration_ms"],
     })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn range(raw: &str, total: u64) -> Result<Option<(u64, u64)>, ()> {
+        parse_range(Some(&HeaderValue::from_str(raw).unwrap()), total)
+    }
+
+    #[test]
+    fn byte_ranges_include_zero_bounded_and_suffix() {
+        assert_eq!(parse_range(None, 100), Ok(None));
+        assert_eq!(range("bytes=0-", 100), Ok(Some((0, 100))));
+        assert_eq!(range("bytes=1-3", 100), Ok(Some((1, 4))));
+        assert_eq!(range("bytes=44-44", 100), Ok(Some((44, 45))));
+        assert_eq!(range("bytes=90-999", 100), Ok(Some((90, 100))));
+        assert_eq!(range("bytes=-10", 100), Ok(Some((90, 100))));
+        assert_eq!(range("bytes=-200", 100), Ok(Some((0, 100))));
+        assert_eq!(range("bytes=100-", 100), Err(()));
+        assert_eq!(range("bytes=-0", 100), Err(()));
+        assert_eq!(range("bytes=9-2", 100), Ok(None));
+        assert_eq!(range("bytes=0-", 0), Err(()));
+        assert_eq!(range("bytes=-1", 0), Err(()));
+        assert_eq!(range("bytes=0-0", 0), Err(()));
+        assert_eq!(range("bytes=0-3,7-9", 100), Ok(None));
+        assert_eq!(range("bytes=garbage", 100), Ok(None));
+    }
+
+    #[test]
+    fn response_headers_match_exact_representation_range() {
+        let full = stream_response(axum::body::Body::empty(), 176_444, None);
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()[header::CONTENT_LENGTH], "176444");
+        assert!(!full.headers().contains_key(header::CONTENT_RANGE));
+        for (start, end) in [(0, 44), (44, 45), (176_443, 176_444)] {
+            let partial = stream_response(axum::body::Body::empty(), 176_444, Some((start, end)));
+            assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                partial.headers()[header::CONTENT_LENGTH],
+                (end - start).to_string()
+            );
+            assert_eq!(
+                partial.headers()[header::CONTENT_RANGE],
+                format!("bytes {start}-{}/176444", end - 1)
+            );
+        }
+    }
 }
 
 trait Bearer {

@@ -4,7 +4,7 @@
 //! librespot 播放回调运行在自己的播放线程，经共享 `stream_cell` 交换数据。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use librespot_core::authentication::Credentials;
@@ -28,12 +28,15 @@ pub struct Core {
 pub struct Inner {
     /// 模块数据目录（凭据缓存、临时音频文件）。模块更新时宿主保留 user_data/。
     pub data_dir: PathBuf,
+    pub oauth: crate::oauth_state::OAuthStore,
     /// 本地服务实际监听端口。
     pub port: AtomicU16,
     /// 当前音频流槽位（StreamSink 与 /stream 处理器共享）。
     pub stream_cell: Arc<tokio::sync::Mutex<Option<Arc<TrackStream>>>>,
     session: tokio::sync::Mutex<Option<Session>>,
+    connect_gate: tokio::sync::Mutex<()>,
     player: tokio::sync::Mutex<Option<Arc<Player>>>,
+    playback_change: tokio::sync::Mutex<()>,
     /// 进行中的设备码登录（url + user_code）。
     pub login: tokio::sync::Mutex<Option<(String, String)>>,
     /// 设备码登录进度：0=等待用户授权，1=成功，2=无进行中/已过期（见 LOGIN_* 常量）。
@@ -85,11 +88,14 @@ impl Core {
         Self {
             runtime,
             inner: Arc::new(Inner {
+                oauth: crate::oauth_state::OAuthStore::new(&data_dir),
                 data_dir,
                 port: AtomicU16::new(0),
                 stream_cell: Arc::new(tokio::sync::Mutex::new(None)),
                 session: tokio::sync::Mutex::new(None),
+                connect_gate: tokio::sync::Mutex::new(()),
                 player: tokio::sync::Mutex::new(None),
+                playback_change: tokio::sync::Mutex::new(()),
                 login: tokio::sync::Mutex::new(None),
                 login_state: AtomicU8::new(LOGIN_IDLE),
                 http: reqwest::Client::new(),
@@ -117,6 +123,10 @@ impl Inner {
                 return Ok(s.clone());
             }
         }
+        let _connecting = self.connect_gate.lock().await;
+        if let Some(session) = self.session.lock().await.as_ref() {
+            return Ok(session.clone());
+        }
         let cache = Cache::new(Some(&self.data_dir), None, None, None)
             .map_err(|e| format!("cache init: {e}"))?;
         let Some(creds) = cache.credentials() else {
@@ -135,43 +145,9 @@ impl Inner {
             .await
             .map_err(|e| format!("connect: {e}"))?;
 
-        let player_config = PlayerConfig {
-            bitrate: Bitrate::Bitrate320,
-            ..Default::default()
-        };
-        let cell = self.stream_cell.clone();
-        let player = Player::new(
-            player_config,
-            session.clone(),
-            Box::new(NoOpVolume),
-            move || -> Box<dyn librespot_playback::audio_backend::Sink> {
-                Box::new(StreamSink::new(cell.clone()))
-            },
-        );
-
-        // 事件循环：曲目结束/停止 → 定长收尾；不可播 → 标记失败。
-        let mut events = player.get_player_event_channel();
-        let cell = self.stream_cell.clone();
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                match event {
-                    PlayerEvent::EndOfTrack { .. } | PlayerEvent::Stopped { .. } => {
-                        if let Some(s) = cell.lock().await.clone() {
-                            s.finish();
-                        }
-                    }
-                    PlayerEvent::Unavailable { .. } => {
-                        if let Some(s) = cell.lock().await.clone() {
-                            s.mark_failed();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-
+        // Decoder/sink generations are created only for actual GET playback.
+        // A session reconnect must not redirect an old decoder into a new stream.
         *self.session.lock().await = Some(session.clone());
-        *self.player.lock().await = Some(player);
         Ok(session)
     }
 
@@ -185,27 +161,71 @@ impl Inner {
         Ok((url, track.duration))
     }
 
-    /// /stream 请求：从 `position_ms` 起重启播放，产出新流。
-    pub async fn play_from(&self, track_id: &str, position_ms: u32) -> Result<Arc<TrackStream>, String> {
+    pub async fn track_duration(&self, track_id: &str) -> Result<i32, String> {
         let session = self.ensure_session().await?;
-        let track = fetch_track(&session, track_id).await?;
-        let Some(player) = self.player.lock().await.clone() else {
-            return Err("player unavailable".into());
-        };
+        Ok(fetch_track(&session, track_id).await?.duration)
+    }
 
-        // 旧流收尾并清槽（旧读端会看到提前 EOF 正常结束）。
-        if let Some(old) = self.stream_cell.lock().await.take() {
-            old.finish();
-        }
-
-        let stream = TrackStream::create(&self.temp_dir(), track_id, track.duration)
-            .map_err(|e| format!("create stream: {e}"))?;
-        *self.stream_cell.lock().await = Some(stream.clone());
-
+    /// Each decoder, sink and event receiver owns precisely one stream generation.
+    pub async fn play_from(
+        &self,
+        track_id: &str,
+        duration: i32,
+        position_ms: u32,
+    ) -> Result<Arc<TrackStream>, String> {
         let uri = SpotifyUri::Track {
             id: SpotifyId::from_base62(track_id).map_err(|e| format!("bad track id: {e}"))?,
         };
+        // Serialize session lookup with logout; otherwise a request can capture a
+        // Session, wait behind logout, then start playback on the retired session.
+        let _change = self.playback_change.lock().await;
+        let session = self.ensure_session().await?;
+        let stream = TrackStream::create_at(&self.temp_dir(), track_id, duration, position_ms)
+            .map_err(|e| format!("create stream: {e}"))?;
+        // Wake a backpressured old sink BEFORE dropping Player (which joins its thread).
+        if let Some(old) = self.stream_cell.lock().await.take() {
+            old.cancel();
+        }
+        let old_player = self.player.lock().await.take();
+        if let Some(old) = old_player {
+            tokio::task::spawn_blocking(move || drop(old))
+                .await
+                .map_err(|e| format!("stop old player: {e}"))?;
+        }
+        let sink_stream = stream.clone();
+        let player = Player::new(
+            PlayerConfig {
+                bitrate: Bitrate::Bitrate320,
+                gapless: false,
+                ..Default::default()
+            },
+            session,
+            Box::new(NoOpVolume),
+            move || -> Box<dyn librespot_playback::audio_backend::Sink> {
+                Box::new(StreamSink::new(sink_stream))
+            },
+        );
+        stream.await_decoder_position();
+        let mut events = player.get_player_event_channel();
+        let event_stream = stream.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    PlayerEvent::Playing { position_ms, .. } => {
+                        event_stream.set_decoder_position(position_ms)
+                    }
+                    PlayerEvent::EndOfTrack { .. } => event_stream.finish(),
+                    PlayerEvent::Stopped { .. } | PlayerEvent::Unavailable { .. } => {
+                        event_stream.mark_failed()
+                    }
+                    _ => {}
+                }
+            }
+            event_stream.cancel();
+        });
+        *self.stream_cell.lock().await = Some(stream.clone());
         player.load(uri, true, position_ms);
+        *self.player.lock().await = Some(player);
         Ok(stream)
     }
 
@@ -217,9 +237,12 @@ impl Inner {
     /// 验证码已预填、可直接生成二维码）输入 userCode 即可。前提是 client_id
     /// 被 Spotify 启用了该流程（见本仓库 docs/device-authorization.md）。
     pub async fn auth_login_start(self: Arc<Self>) -> Result<(String, String), String> {
-        let client = librespot_oauth::DeviceAuthClientBuilder::new(KEYMASTER_CLIENT_ID, LOGIN_SCOPES.to_vec())
-            .build()
-            .map_err(|e| format!("device auth unavailable: {e}"))?;
+        let client = librespot_oauth::DeviceAuthClientBuilder::new(
+            KEYMASTER_CLIENT_ID,
+            LOGIN_SCOPES.to_vec(),
+        )
+        .build()
+        .map_err(|e| format!("device auth unavailable: {e}"))?;
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(String, String), String>>();
         let inner = self.clone();
@@ -241,6 +264,15 @@ impl Inner {
                     let creds = Credentials::with_access_token(&token.access_token);
                     match core.runtime.block_on(inner.connect_and_install(creds)) {
                         Ok(_) => {
+                            if core
+                                .runtime
+                                .block_on(inner.oauth.save_grant(token))
+                                .is_err()
+                            {
+                                inner.login_state.store(LOGIN_IDLE, Ordering::SeqCst);
+                                log::warn!("OAuth credential persistence failed");
+                                return;
+                            }
                             inner.login_state.store(LOGIN_DONE, Ordering::SeqCst);
                             core.runtime.block_on(async {
                                 *inner.login.lock().await = None;
@@ -290,8 +322,15 @@ impl Inner {
 
     /// logout：删除缓存凭据并断开当前会话。
     pub async fn logout(&self) -> bool {
+        self.oauth.clear().await;
+        let _change = self.playback_change.lock().await;
         *self.session.lock().await = None;
-        *self.player.lock().await = None;
+        if let Some(stream) = self.stream_cell.lock().await.take() {
+            stream.cancel();
+        }
+        if let Some(player) = self.player.lock().await.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(player)).await;
+        }
         *self.login.lock().await = None;
         self.login_state.store(LOGIN_IDLE, Ordering::SeqCst);
         ["credentials", "credentials.json"]
@@ -305,8 +344,8 @@ impl Inner {
         let guard = self.stream_cell.lock().await;
         guard.as_ref().and_then(|s| {
             let name = s.path.file_name()?.to_string_lossy().into_owned();
-            let expect = format!("cp_spotify_{track_id}.wav");
-            (name == expect).then(|| s.clone())
+            let expect = format!("cp_spotify_{track_id}_");
+            name.starts_with(&expect).then(|| s.clone())
         })
     }
 }
@@ -314,7 +353,9 @@ impl Inner {
 async fn fetch_track(session: &Session, track_id: &str) -> Result<Track, String> {
     let id = SpotifyId::from_base62(track_id).map_err(|e| format!("bad track id: {e}"))?;
     let uri = SpotifyUri::Track { id };
-    Track::get(session, &uri).await.map_err(|e| format!("metadata: {e}"))
+    Track::get(session, &uri)
+        .await
+        .map_err(|e| format!("metadata: {e}"))
 }
 
 /// 会话配置：client_id 固定为桌面 Keymaster，其余沿用默认。

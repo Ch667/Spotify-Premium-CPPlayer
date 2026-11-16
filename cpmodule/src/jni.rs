@@ -16,15 +16,15 @@
 //! 这里在 `login/qr/create` 返回后直接 `ACTION_VIEW` 调起系统浏览器，
 //! 用户点一下登录就跳到网页授权，不必自己扫码。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 #[cfg(target_os = "android")]
 use jni::objects::{JObject, JValue, JValueOwned};
 use jni::sys::{jint, jstring};
-use jni::JNIEnv;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::api;
 use crate::engine::Core;
@@ -63,7 +63,12 @@ fn open_in_browser(env: &mut JNIEnv, url: &str) -> Result<(), String> {
         _ => return Err("currentActivityThread returned non-object".into()),
     };
     let app = env
-        .call_method(&thread, "getApplication", "()Landroid/app/Application;", &[])
+        .call_method(
+            &thread,
+            "getApplication",
+            "()Landroid/app/Application;",
+            &[],
+        )
         .map_err(|e| format!("getApplication: {e}"))?;
     let app = match app {
         JValueOwned::Object(o) => o,
@@ -179,8 +184,7 @@ pub extern "system" fn Java_cp_player_core_provider_JniProvider_nativeCallApi(
         }
 
         let params_str = jstr_to_string(&mut env, &params).unwrap_or_else(|| "{}".into());
-        let params: serde_json::Value =
-            serde_json::from_str(&params_str).unwrap_or(json!({}));
+        let params: serde_json::Value = serde_json::from_str(&params_str).unwrap_or(json!({}));
 
         let core = Core::global();
         let resp = core.runtime.block_on(api::dispatch(core, &method, params));
