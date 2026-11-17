@@ -115,24 +115,56 @@ async fn web_token(scope: Option<&str>) -> Result<String, String> {
     Ok(token.access_token)
 }
 
-/// GET 一个 Web API 端点并解成 JSON。HTTP 状态码按语义映射成失败类别。
-fn web_get(url: String) -> ProviderResult<Value> {
-    core().runtime.block_on(async move {
-        let token = web_token(scope_for_url(&url)).await.map_err(|_| {
-            Failure::new(
-                FailureCategory::Authentication,
-                "Spotify Web API 授权无效或缺少权限，请重新登录",
-            )
-        })?;
+/// Spotify's Web API applies a shared application quota. Serialize module
+/// requests and leave a small gap so account-page fan-out and library paging do
+/// not create a burst. A 429 extends this gate using Spotify's Retry-After.
+fn api_gate() -> &'static tokio::sync::Mutex<tokio::time::Instant> {
+    static GATE: std::sync::OnceLock<tokio::sync::Mutex<tokio::time::Instant>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(tokio::time::Instant::now()))
+}
+
+fn retry_after_seconds(value: Option<&str>, attempt: u32) -> u64 {
+    const MAX_RETRY_AFTER: u64 = 120;
+    value
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(if attempt == 0 { 2 } else { 5 })
+        .clamp(1, MAX_RETRY_AFTER)
+}
+
+async fn limited_get(url: &str, token: &str) -> ProviderResult<Value> {
+    const REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(400);
+
+    let mut next_allowed = api_gate().lock().await;
+    for attempt in 0..=1 {
+        tokio::time::sleep_until(*next_allowed).await;
         let resp = core()
             .inner
             .http()
-            .get(&url)
-            .bearer_auth(&token)
+            .get(url)
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|e| classify(format!("network: {e}")))?;
         let status = resp.status();
+        if status.as_u16() == 429 {
+            let retry_value = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok());
+            let retry_after = retry_after_seconds(retry_value, attempt);
+            *next_allowed =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(retry_after);
+            if attempt == 0 {
+                tokio::time::sleep_until(*next_allowed).await;
+                continue;
+            }
+            return fail(
+                FailureCategory::RateLimit,
+                format!("Spotify 限流，服务端要求等待 {retry_after} 秒后重试"),
+            );
+        }
+        *next_allowed = tokio::time::Instant::now() + REQUEST_GAP;
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return fail(
                 FailureCategory::Authentication,
@@ -142,18 +174,30 @@ fn web_get(url: String) -> ProviderResult<Value> {
         if status.as_u16() == 404 {
             return fail(FailureCategory::NotFound, "未找到");
         }
-        if status.as_u16() == 429 {
-            return fail(FailureCategory::RateLimit, "请求过于频繁，请稍后重试");
-        }
         if !status.is_success() {
             return fail(
                 FailureCategory::Network,
                 format!("Spotify 返回 HTTP {status}"),
             );
         }
-        resp.json::<Value>()
+        return resp
+            .json::<Value>()
             .await
-            .map_err(|e| Failure::new(FailureCategory::InvalidResponse, format!("decode: {e}")))
+            .map_err(|e| Failure::new(FailureCategory::InvalidResponse, format!("decode: {e}")));
+    }
+    fail(FailureCategory::RateLimit, "Spotify 请求受限，请稍后重试")
+}
+
+/// GET 一个 Web API 端点并解成 JSON。HTTP 状态码按语义映射成失败类别。
+fn web_get(url: String) -> ProviderResult<Value> {
+    core().runtime.block_on(async move {
+        let token = web_token(scope_for_url(&url)).await.map_err(|_| {
+            Failure::new(
+                FailureCategory::Authentication,
+                "Spotify Web API 授权无效或缺少权限，请重新登录",
+            )
+        })?;
+        limited_get(&url, &token).await
     })
 }
 
@@ -897,6 +941,18 @@ fn playlist_of(p: &Value) -> Option<Playlist> {
 mod tests {
     use super::*;
     use cpplayer_provider_sdk::{WireReader, WireWriter, dispatch};
+
+    #[test]
+    fn retry_after_is_honored_and_clamped() {
+        assert_eq!(retry_after_seconds(Some("7"), 0), 7);
+        assert_eq!(retry_after_seconds(Some("0"), 0), 1);
+        assert_eq!(retry_after_seconds(Some("999"), 0), 120);
+        assert_eq!(
+            retry_after_seconds(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 0),
+            2
+        );
+        assert_eq!(retry_after_seconds(None, 1), 5);
+    }
 
     /// `login_state` 是进程内全局量，会改它的测试必须串行，否则互相踩。
     static LOGIN_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
